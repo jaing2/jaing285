@@ -11,6 +11,9 @@ LLM: Groq (선택 사항 — 키가 없어도 규칙 기반 분석은 그대로 
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import platform
 import sys
 import time
@@ -181,12 +184,43 @@ def _retry(fn: Callable, tries: int = 3, delay: float = 0.8):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# pykrx 지연 임포트
+# ──────────────────────────────────────────────────────────────────────────────
+
+_STOCK = None
+
+
+def get_stock_api():
+    """
+    pykrx.stock 을 지연 임포트합니다.
+
+    - Secrets 에 KRX_ID / KRX_PW 가 있으면 환경변수로 주입해 인증 세션을 씁니다.
+      (없으면 pykrx 가 익명 세션으로 자동 폴백하므로 필수는 아닙니다.)
+    - pykrx 가 임포트 시점에 출력하는 로그인 안내문을 화면에서 가립니다.
+    """
+    global _STOCK
+    if _STOCK is not None:
+        return _STOCK
+    try:
+        for key in ("KRX_ID", "KRX_PW"):
+            val = st.secrets.get(key, "")
+            if val and not os.getenv(key):
+                os.environ[key] = str(val)
+    except Exception:  # noqa: BLE001
+        pass
+    with contextlib.redirect_stdout(io.StringIO()):
+        from pykrx import stock as _s
+    _STOCK = _s
+    return _STOCK
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 데이터 레이어
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _fetch_index(start: str, end: str) -> pd.DataFrame:
     """코스피 지수 OHLCV. pykrx 버전에 따라 함수명이 달라 두 가지를 모두 시도."""
-    from pykrx import stock
+    stock = get_stock_api()
 
     for name in ("get_index_ohlcv", "get_index_ohlcv_by_date"):
         fn = getattr(stock, name, None)
@@ -226,7 +260,7 @@ def _normalize_flow(raw: pd.DataFrame) -> pd.DataFrame:
 
 def _fetch_flow_by_date(start: str, end: str) -> pd.DataFrame:
     """1회 호출로 기간 전체 수급을 가져옵니다 (권장 경로)."""
-    from pykrx import stock
+    stock = get_stock_api()
 
     fn = getattr(stock, "get_market_trading_value_by_date", None)
     if fn is None:
@@ -242,7 +276,7 @@ def _fetch_flow_by_date(start: str, end: str) -> pd.DataFrame:
 
 def _fetch_flow_loop(dates: Iterable[pd.Timestamp]) -> pd.DataFrame:
     """폴백: 영업일별로 하루씩 조회."""
-    from pykrx import stock
+    stock = get_stock_api()
 
     rows = {}
     for d in dates:
@@ -558,11 +592,21 @@ with st.spinner("KRX 수급 데이터를 불러오는 중…"):
         load_error = e
 
 if load_error is not None:
-    st.error(
-        f"데이터를 불러오지 못했습니다 — {type(load_error).__name__}: {load_error}\n\n"
-        "KRX 서버 응답 지연이거나 pykrx 버전 변경일 수 있습니다. "
-        "사이드바의 **데이터 새로고침**을 누르거나, 아래 진단 정보를 확인하세요."
-    )
+    msg = str(load_error)
+    if isinstance(load_error, ModuleNotFoundError) and "pkg_resources" in msg:
+        hint = (
+            "구버전 pykrx 가 설치됐습니다. setuptools 82 부터 pkg_resources 가 제거되어 "
+            "임포트가 실패합니다. requirements.txt 에 `pykrx>=1.2.8` 과 `pandas>=2.3.3,<3` 을 "
+            "지정하세요."
+        )
+    elif isinstance(load_error, ModuleNotFoundError):
+        hint = "의존성이 설치되지 않았습니다. requirements.txt 와 빌드 로그를 확인하세요."
+    else:
+        hint = (
+            "KRX 서버 응답 지연이거나 pykrx 응답 형식 변경일 수 있습니다. "
+            "사이드바의 **데이터 새로고침**을 눌러 보세요."
+        )
+    st.error(f"데이터를 불러오지 못했습니다 — {type(load_error).__name__}: {msg}\n\n{hint}")
     with st.expander("진단 정보"):
         st.write({"python": sys.version, "platform": platform.platform()})
         st.write({"pandas": pd.__version__, "streamlit": st.__version__})
