@@ -158,6 +158,25 @@ def kpi(label: str, value: str, note: str = "", tone: str = COLOR_MUTED) -> str:
     )
 
 
+_PYKRX_LOG: list[str] = []
+
+
+@contextlib.contextmanager
+def capture_pykrx_log():
+    """
+    pykrx 는 내부에서 예외를 삼키고 빈 DataFrame 을 돌려주면서
+    'Error occurred in ...' 를 stdout 으로만 흘립니다. 그 문구를 붙잡아 둡니다.
+    """
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            yield buf
+    finally:
+        text = buf.getvalue().strip()
+        if text:
+            _PYKRX_LOG.extend(line for line in text.splitlines() if line.strip())
+
+
 def _pick(cols: Iterable, *candidates: str) -> Optional[str]:
     """정확 일치 → 부분 일치 순으로 컬럼명을 찾습니다 (pykrx 버전별 컬럼명 차이 흡수)."""
     cols = list(cols)
@@ -227,8 +246,10 @@ def _fetch_index(start: str, end: str) -> pd.DataFrame:
         if fn is None:
             continue
         try:
-            df = _retry(lambda: fn(start, end, KOSPI_INDEX_TICKER))
-        except Exception:  # noqa: BLE001
+            with capture_pykrx_log():
+                df = _retry(lambda: fn(start, end, KOSPI_INDEX_TICKER))
+        except Exception as e:  # noqa: BLE001
+            _PYKRX_LOG.append(f"{name} 예외: {type(e).__name__}: {e}")
             continue
         if df is not None and not df.empty:
             df = df.copy()
@@ -265,7 +286,8 @@ def _fetch_flow_by_date(start: str, end: str) -> pd.DataFrame:
     fn = getattr(stock, "get_market_trading_value_by_date", None)
     if fn is None:
         raise AttributeError("get_market_trading_value_by_date 없음")
-    df = _retry(lambda: fn(start, end, "KOSPI"))
+    with capture_pykrx_log():
+        df = _retry(lambda: fn(start, end, "KOSPI"))
     if df is None or df.empty:
         raise ValueError("빈 응답")
     cols = list(df.columns)
@@ -282,7 +304,10 @@ def _fetch_flow_loop(dates: Iterable[pd.Timestamp]) -> pd.DataFrame:
     for d in dates:
         ds = pd.Timestamp(d).strftime("%Y%m%d")
         try:
-            df = _retry(lambda: stock.get_market_trading_value_by_investor(ds, ds, "KOSPI"), tries=2)
+            with capture_pykrx_log():
+                df = _retry(
+                    lambda: stock.get_market_trading_value_by_investor(ds, ds, "KOSPI"), tries=2
+                )
         except Exception:  # noqa: BLE001
             continue
         col = _pick(df.columns, "순매수")
@@ -307,9 +332,14 @@ def load_market(lookback: int, ma_window: int) -> tuple[pd.DataFrame, dict]:
     index_start = (today - timedelta(days=int((lookback + ma_window) * 2.2) + 40)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
 
+    _PYKRX_LOG.clear()
     idx = _fetch_index(index_start, end)
     if idx.empty:
-        raise RuntimeError("코스피 지수 데이터를 가져오지 못했습니다. KRX 응답이 비어 있습니다.")
+        detail = " | ".join(_PYKRX_LOG[:6]) or "pykrx 가 아무 메시지도 남기지 않았습니다"
+        meta["pykrx_log"] = list(_PYKRX_LOG)
+        raise RuntimeError(
+            f"코스피 지수 응답이 비어 있습니다 (조회 {index_start}~{end}). pykrx 내부 메시지: {detail}"
+        )
 
     idx["MA"] = idx["코스피지수"].rolling(ma_window, min_periods=max(2, ma_window // 2)).mean()
 
@@ -327,9 +357,68 @@ def load_market(lookback: int, ma_window: int) -> tuple[pd.DataFrame, dict]:
         raise RuntimeError("수급·지수 데이터 병합 결과가 비어 있습니다.")
 
     df = df.tail(lookback)
+    meta["pykrx_log"] = list(_PYKRX_LOG)
     meta["rows"] = len(df)
     meta["fetched_at"] = now_kst().strftime("%Y-%m-%d %H:%M:%S KST")
     return df, meta
+
+
+
+def probe_krx() -> dict:
+    """
+    pykrx 와 동일한 요청을 직접 보내 KRX 가 무엇을 돌려주는지 확인합니다.
+    JSON 이 오면 API 는 살아있는 것이고, HTML/403 이면 접근이 차단된 것입니다.
+    """
+    import requests
+
+    url = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    end = now_kst().strftime("%Y%m%d")
+    start = (now_kst() - timedelta(days=14)).strftime("%Y%m%d")
+    payload = {
+        "bld": "dbms/MDC/STAT/standard/MDCSTAT00301",
+        "tboxindIdx_finder_equidx0_0": "코스피",
+        "indIdx": "1",
+        "indIdx2": "001",
+        "codeNmindIdx_finder_equidx0_0": "코스피",
+        "strtDd": start,
+        "endDd": end,
+        "share": "2",
+        "money": "3",
+        "csvxls_isNo": "false",
+    }
+    out: dict = {"요청": f"{start}~{end}"}
+    try:
+        r = requests.post(url, headers=headers, data=payload, timeout=20)
+        out["HTTP 상태"] = r.status_code
+        out["Content-Type"] = r.headers.get("Content-Type", "?")
+        out["응답 길이"] = len(r.content)
+        body = r.text[:300]
+        out["응답 앞부분"] = body
+        try:
+            js = r.json()
+            key = next((k for k in js if isinstance(js[k], list)), None)
+            out["JSON 파싱"] = "성공"
+            out["데이터 행 수"] = len(js[key]) if key else 0
+            out["판정"] = (
+                "정상 — KRX 가 데이터를 반환했습니다"
+                if key and js[key]
+                else "JSON 은 왔지만 데이터가 비어 있습니다 (파라미터 또는 기간 문제)"
+            )
+        except Exception:  # noqa: BLE001
+            out["JSON 파싱"] = "실패"
+            out["판정"] = (
+                "HTML 이 돌아왔습니다 — KRX 가 이 서버의 접근을 차단했을 가능성이 높습니다"
+                if "<html" in body.lower() or "<!doctype" in body.lower()
+                else "예상치 못한 응답 형식입니다"
+            )
+    except Exception as e:  # noqa: BLE001
+        out["판정"] = f"요청 자체 실패 — {type(e).__name__}: {e}"
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -607,7 +696,15 @@ if load_error is not None:
             "사이드바의 **데이터 새로고침**을 눌러 보세요."
         )
     st.error(f"데이터를 불러오지 못했습니다 — {type(load_error).__name__}: {msg}\n\n{hint}")
-    with st.expander("진단 정보"):
+    if _PYKRX_LOG:
+        st.markdown("**pykrx 내부 메시지**")
+        st.code("\n".join(_PYKRX_LOG[:12]))
+
+    st.markdown("**KRX 연결 진단**")
+    if st.button("KRX 서버에 직접 요청해 보기"):
+        st.json(probe_krx())
+
+    with st.expander("환경 정보"):
         st.write({"python": sys.version, "platform": platform.platform()})
         st.write({"pandas": pd.__version__, "streamlit": st.__version__})
         try:
@@ -825,6 +922,15 @@ with tab_diag:
         st.write("pykrx 버전:", getattr(pykrx, "__version__", "unknown"))
     except Exception as e:  # noqa: BLE001
         st.write("pykrx import 실패:", str(e))
+
+    if meta.get("pykrx_log"):
+        st.markdown("**pykrx 내부 메시지**")
+        st.code("\n".join(meta["pykrx_log"][:12]))
+
+    st.markdown("**KRX 연결 진단**")
+    st.caption("pykrx 와 동일한 요청을 직접 보내 서버 응답을 그대로 보여줍니다.")
+    if st.button("KRX 서버에 직접 요청해 보기", key="probe_tab"):
+        st.json(probe_krx())
 
 st.divider()
 st.markdown(
