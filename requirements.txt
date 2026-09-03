@@ -3,10 +3,10 @@
 #
 # pandas: 2.x 중 cp314 휠이 있는 버전은 2.3.3 뿐입니다.
 #         pykrx 1.2.x 가 pandas<3.0 을 요구하므로 상한을 함께 지정합니다.
-#         (상한이 없으면 pandas 3.x 가 설치되고, 의존성 해석기가 pykrx 를
-#          pkg_resources 를 쓰는 구버전으로 되돌려 임포트가 실패합니다.)
+# plotly: 캔들 차트용. 순수 파이썬 패키지라 빌드 위험이 없습니다.
 
 streamlit>=1.60
 pykrx>=1.2.8
 pandas>=2.3.3,<3
+plotly>=6.0
 groq>=1.0
