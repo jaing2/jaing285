@@ -233,11 +233,18 @@ def _pick(cols: Iterable, *candidates: str) -> Optional[str]:
     return None
 
 
+# 재시도해도 결과가 달라지지 않는 예외들 (파싱·구조 문제)
+DETERMINISTIC = (KeyError, AttributeError, TypeError, IndexError)
+
+
 def _retry(fn: Callable, stage: str, tries: int = 3, delay: float = 0.8):
     last = None
     for i in range(tries):
         try:
             return fn()
+        except DETERMINISTIC as e:
+            log(stage, f"재시도 생략 (결정적 오류) — {type(e).__name__}: {e}", level="WARN")
+            raise
         except Exception as e:  # noqa: BLE001
             last = e
             log(stage, f"재시도 {i+1}/{tries} — {type(e).__name__}: {e}", level="WARN")
@@ -414,6 +421,12 @@ def classify_failure(exc: BaseException, entries: list[dict]) -> tuple[str, str]
             "로그인은 됐지만 세션이 곧바로 만료됐을 수 있습니다. "
             "진단 탭의 KRX 직접 요청으로 원본 응답을 확인하세요.",
         )
+    if "지수명" in blob:
+        return (
+            "pykrx 의 지수명 조회 단계가 실패했습니다.",
+            "시세 데이터 자체는 정상입니다. name_display=False 로 우회하도록 되어 있으니 "
+            "app.py 가 최신인지 확인하세요.",
+        )
     if "KeyError" in msg or "KeyError" in blob:
         return (
             "응답은 왔지만 컬럼 구조가 예상과 다릅니다.",
@@ -429,24 +442,43 @@ def classify_failure(exc: BaseException, entries: list[dict]) -> tuple[str, str]
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _fetch_index(start: str, end: str) -> pd.DataFrame:
+    """
+    코스피 지수 OHLCV.
+
+    pykrx 는 name_display=True 일 때 지수명을 따로 조회하는데, 그 내부 호출이
+    실패하면 빈 표에 접근하면서 KeyError('지수명') 을 냅니다. 시세 자체와는
+    무관한 장식용 단계라 끄고 호출합니다.
+    """
     stock = get_stock_api()
-    for name in ("get_index_ohlcv", "get_index_ohlcv_by_date"):
+    attempts = [
+        ("get_index_ohlcv", {"name_display": False}),
+        ("get_index_ohlcv_by_date", {"name_display": False}),
+        ("get_index_ohlcv", {}),
+        ("get_index_ohlcv_by_date", {}),
+    ]
+    for name, kwargs in attempts:
         fn = getattr(stock, name, None)
         if fn is None:
             log("지수조회", f"{name} 없음", level="DEBUG")
             continue
+        label = f"{name}({'name_display=False' if kwargs else '기본'})"
         try:
             with capture_stdout("지수조회"):
-                df = _retry(lambda: fn(start, end, KOSPI_INDEX_TICKER), "지수조회")
+                df = _retry(
+                    lambda: fn(start, end, KOSPI_INDEX_TICKER, **kwargs), "지수조회", tries=2
+                )
+        except TypeError as e:
+            log("지수조회", f"{label} 인자 미지원 — {e}", level="DEBUG")
+            continue
         except Exception as e:  # noqa: BLE001
-            log_exc("지수조회", e, f"{name} 호출 실패")
+            log_exc("지수조회", e, f"{label} 호출 실패")
             continue
         if df is None or df.empty:
-            log("지수조회", f"{name} 이 빈 결과 반환", level="WARN")
+            log("지수조회", f"{label} 빈 결과 반환", level="WARN")
             continue
         close_col = _pick(df.columns, "종가", "close")
         if close_col is None:
-            log("지수조회", f"{name} 응답에 종가 컬럼 없음", level="WARN",
+            log("지수조회", f"{label} 응답에 종가 컬럼 없음", level="WARN",
                 컬럼=",".join(map(str, df.columns))[:120])
             continue
         out = pd.DataFrame(
@@ -454,7 +486,7 @@ def _fetch_index(start: str, end: str) -> pd.DataFrame:
         )
         out.index = pd.to_datetime(df.index)
         out = out.dropna()
-        log("지수조회", f"{name} 성공", 행수=len(out),
+        log("지수조회", f"{label} 성공", 행수=len(out),
             기간=f"{out.index[0]:%Y-%m-%d}~{out.index[-1]:%Y-%m-%d}" if len(out) else "-")
         return out
     return pd.DataFrame(columns=["코스피지수"])
