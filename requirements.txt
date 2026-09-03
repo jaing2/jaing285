@@ -1,5 +1,9 @@
-streamlit==1.32.0
-pykrx==1.0.48
-pandas==2.2.1
-numpy==1.26.4
-groq==0.4.2
+# Streamlit Community Cloud는 현재 Python 3.14 환경으로 빌드합니다.
+# 구버전으로 고정(==)하면 cp314 휠이 없어 소스 빌드로 넘어가고,
+# 빌드 컨테이너에 zlib 헤더가 없어 pillow/pandas 컴파일이 실패합니다.
+# 따라서 하한선(>=)만 지정해 항상 사전 컴파일된 휠을 받도록 합니다.
+
+streamlit>=1.50
+pandas>=2.2.3
+pykrx>=1.0.45
+groq>=0.11
