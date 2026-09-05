@@ -1169,13 +1169,30 @@ def load_universe(short_days: int, long_days: int, auth_key: str) -> pd.DataFram
     except Exception as e:  # noqa: BLE001
         log_exc("스크리너", e, "보강 지표 결합 실패")
 
+    try:
+        uni["업종"] = load_sector_map(auth_key)["업종"].reindex(uni.index).fillna("미분류")
+    except Exception as e:  # noqa: BLE001
+        log_exc("스크리너", e, "업종 분류 결합 실패")
+        uni["업종"] = "미분류"
+    try:
+        uni["공매도거래비중"] = load_short_volume(auth_key)["공매도거래비중"].reindex(uni.index)
+    except Exception as e:  # noqa: BLE001
+        log_exc("스크리너", e, "공매도 거래비중 결합 실패")
+    try:
+        k200 = load_kospi200(auth_key)
+        uni["코스피200"] = [t in k200 for t in uni.index] if k200 else False
+    except Exception as e:  # noqa: BLE001
+        log_exc("스크리너", e, "코스피200 결합 실패")
+        uni["코스피200"] = False
+
     uni["기준일"] = end
     log("스크리너", "유니버스 완성", 종목수=len(uni))
     return uni
 
 
 def screen_stocks(uni: pd.DataFrame, mode: str, min_cap: int, min_value: int,
-                  exclude_pref: bool = True) -> pd.DataFrame:
+                  exclude_pref: bool = True, k200_only: bool = False,
+                  max_short: float = 100.0) -> pd.DataFrame:
     """
     순매수는 절대 금액이 아니라 시가총액 대비 비율로 평가합니다.
     금액만 보면 대형주만 상위에 남아 정보가 없습니다.
@@ -1184,6 +1201,10 @@ def screen_stocks(uni: pd.DataFrame, mode: str, min_cap: int, min_value: int,
     if exclude_pref:
         d = d[[str(t).endswith("0") for t in d.index]]          # 우선주 제외
     d = d[(d["시가총액"] >= min_cap) & (d["거래대금"] >= min_value)]
+    if k200_only and "코스피200" in d.columns:
+        d = d[d["코스피200"].fillna(False)]
+    if max_short < 100 and "공매도비중" in d.columns:
+        d = d[d["공매도비중"].fillna(0) <= max_short]
     d = d.dropna(subset=["종가", "시가총액"])
     if d.empty:
         return d
@@ -2142,6 +2163,163 @@ def journal_summary(stats: pd.DataFrame) -> dict:
         "최대손실": round(stats["실현손익"].min(), 0),
     }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 섹터 · 공매도 · 시장 밸류에이션
+# ──────────────────────────────────────────────────────────────────────────────
+
+KOSPI200_TICKER = "1028"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sector_map(auth_key: str) -> pd.DataFrame:
+    """전종목 업종 분류. 1회 호출로 시장 전체를 받습니다."""
+    stock = get_stock_api()
+    date = _latest_bday()
+    with capture_stdout("섹터"):
+        df = _retry(lambda: stock.get_market_sector_classifications(date, "KOSPI"),
+                    "섹터", tries=2)
+    if df is None or df.empty:
+        raise RuntimeError("업종 분류 데이터가 비어 있습니다")
+    col = _pick(df.columns, "업종명")
+    out = pd.DataFrame(index=df.index)
+    out["업종"] = df[col] if col is not None else "미분류"
+    log("섹터", "업종 분류 수신", 종목수=len(out), 업종수=out["업종"].nunique())
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_kospi200(auth_key: str) -> set:
+    """코스피200 구성종목. 기관 매수 대상이자 유동성 하한 역할을 합니다."""
+    stock = get_stock_api()
+    try:
+        with capture_stdout("지수구성"):
+            lst = _retry(lambda: stock.get_index_portfolio_deposit_file(KOSPI200_TICKER),
+                         "지수구성", tries=2)
+        log("지수구성", "코스피200 수신", 종목수=len(lst or []))
+        return set(lst or [])
+    except Exception as e:  # noqa: BLE001
+        log_exc("지수구성", e, "코스피200 조회 실패")
+        return set()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_short_volume(auth_key: str) -> pd.DataFrame:
+    """
+    전종목 공매도 '거래' 비중. 앞서 쓰던 잔고 비중과는 다른 지표입니다.
+      - 잔고 비중: 상장주식 대비 남아 있는 공매도 포지션 (누적)
+      - 거래 비중: 그날 거래량 중 공매도가 차지한 비율 (유량)
+    거래 비중이 급등하면 지금 팔고 있다는 뜻입니다.
+    """
+    stock = get_stock_api()
+    date = _latest_bday()
+    with capture_stdout("공매도"):
+        df = _retry(lambda: stock.get_shorting_volume_by_ticker(date, "KOSPI"), "공매도", tries=2)
+    if df is None or df.empty:
+        raise RuntimeError("공매도 거래량 데이터가 비어 있습니다")
+    col = _pick(df.columns, "비중")
+    out = pd.DataFrame(index=df.index)
+    out["공매도거래비중"] = pd.to_numeric(df[col], errors="coerce") if col is not None else float("nan")
+    log("공매도", "거래 비중 수신", 종목수=len(out))
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_index_valuation(years: int, auth_key: str) -> pd.DataFrame:
+    """코스피 지수의 PER/PBR/배당수익률 시계열. 지금 시장이 역사적으로 어디쯤인지."""
+    stock = get_stock_api()
+    end = _latest_bday()
+    start = (pd.Timestamp(end) - pd.Timedelta(days=365 * years)).strftime("%Y%m%d")
+    with capture_stdout("밸류"):
+        df = _retry(lambda: stock.get_index_fundamental(start, end, KOSPI_INDEX_TICKER),
+                    "밸류", tries=2)
+    if df is None or df.empty:
+        raise RuntimeError("지수 밸류에이션 데이터가 비어 있습니다")
+    d = df.copy()
+    d.index = pd.to_datetime(d.index)
+    out = pd.DataFrame(index=d.index)
+    for want in ("PER", "PBR", "배당수익률"):
+        c_ = _pick(d.columns, want)
+        if c_ is not None:
+            out[want] = pd.to_numeric(d[c_], errors="coerce")
+    out = out.replace(0, float("nan")).dropna(how="all")
+    log("밸류", "지수 밸류에이션 수신", 행수=len(out), 컬럼=",".join(out.columns))
+    return out
+
+
+def valuation_percentile(series: pd.Series) -> dict:
+    s = series.dropna()
+    if len(s) < 30:
+        return {}
+    cur = float(s.iloc[-1])
+    pct = float((s < cur).mean() * 100)
+    return {"현재": cur, "백분위": pct, "최저": float(s.min()), "최고": float(s.max()),
+            "중앙값": float(s.median()), "표본": len(s)}
+
+
+def sector_rotation(uni: pd.DataFrame, min_count: int = 3) -> pd.DataFrame:
+    """
+    업종별로 등락률과 순매수를 집계합니다.
+    추가 호출 없이 이미 받아온 유니버스에서 계산합니다.
+    """
+    if "업종" not in uni.columns:
+        return pd.DataFrame()
+    d = uni.dropna(subset=["시가총액"]).copy()
+    g = d.groupby("업종")
+    out = pd.DataFrame({
+        "종목수": g.size(),
+        "시총합(조)": (g["시가총액"].sum() / 1e4).round(1),
+        "단기등락률(%)": g["단기등락률"].median().round(2),
+        "장기등락률(%)": g["장기등락률"].median().round(2),
+        "PBR중앙값": g["PBR"].median().round(2),
+    })
+    for inv in ["외국인", "기관합계", "기타법인", "연기금"]:
+        col = f"순매수_{inv}"
+        if col in d.columns:
+            out[f"{inv}(억)"] = g[col].sum().round(0)
+    if "공매도비중" in d.columns:
+        out["공매도잔고(%)"] = g["공매도비중"].median().round(2)
+    out = out[out["종목수"] >= min_count]
+    # 시총 대비 외국인 순매수 강도로 정렬
+    if "외국인(억)" in out.columns:
+        out["외국인강도(%)"] = (out["외국인(억)"] / (out["시총합(조)"] * 1e4) * 100).round(3)
+        out = out.sort_values("외국인강도(%)", ascending=False)
+    return out
+
+
+def sector_concentration(plan: pd.DataFrame, sector_map: pd.DataFrame) -> pd.DataFrame:
+    """매매 계획의 업종 쏠림. 분산이 안 되면 종목 수가 많아도 한 방에 갑니다."""
+    if plan is None or plan.empty or sector_map is None or sector_map.empty:
+        return pd.DataFrame()
+    d = plan.copy()
+    d["업종"] = sector_map["업종"].reindex(d.index).fillna("미분류")
+    g = d.groupby("업종").agg(종목수=("금액", "size"), 금액=("금액", "sum"),
+                            리스크=("리스크(원)", "sum"))
+    total = g["금액"].sum()
+    g["비중(%)"] = (g["금액"] / total * 100).round(1) if total else 0.0
+    return g.sort_values("금액", ascending=False)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_stock_short(ticker: str, days: int, auth_key: str) -> pd.DataFrame:
+    """종목별 공매도 잔고 추이. 매수 신호를 정면으로 반박할 수 있는 유일한 지표입니다."""
+    stock = get_stock_api()
+    end = _latest_bday()
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y%m%d")
+    with capture_stdout("종목공매도"):
+        df = _retry(lambda: stock.get_shorting_balance_by_date(start, end, ticker),
+                    "종목공매도", tries=2)
+    if df is None or df.empty:
+        raise RuntimeError("공매도 잔고 데이터가 비어 있습니다")
+    d = df.copy()
+    d.index = pd.to_datetime(d.index)
+    out = pd.DataFrame(index=d.index)
+    for want, name in [("공매도잔고", "잔고수량"), ("비중", "잔고비중(%)")]:
+        c_ = _pick(d.columns, want)
+        if c_ is not None:
+            out[name] = pd.to_numeric(d[c_], errors="coerce")
+    log("종목공매도", "수신", 티커=ticker, 행수=len(out))
+    return out
+
 # 판단 5인 + 실행 5인 + 차트 1인
 ALL_PERSONAS = PERSONAS + EXEC_PERSONAS + [CHART_PERSONA]
 
@@ -2284,10 +2462,10 @@ st.write("")
 # 탭
 # ──────────────────────────────────────────────────────────────────────────────
 
-(tab_chart, tab_flow, tab_corp, tab_screen, tab_plan, tab_watch,
+(tab_chart, tab_flow, tab_sector, tab_corp, tab_screen, tab_plan, tab_watch,
  tab_persona, tab_bt, tab_diag) = st.tabs(
-    ["캔들 차트", "수급 상세", "기타법인 추적", "종목 스크리너", "매매 계획",
-     "관심종목", "페르소나 회의", "검증", "진단"])
+    ["캔들 차트", "수급 상세", "섹터·밸류", "기타법인 추적", "종목 스크리너",
+     "매매 계획", "관심종목", "페르소나 회의", "검증", "진단"])
 
 with tab_chart:
     opt = st.columns([2.2, 1, 1])
@@ -2601,6 +2779,11 @@ with tab_screen:
     min_cap = f[2].number_input("최소 시총(억)", 500, 100000, 3000, step=500)
     min_val = f[3].number_input("최소 거래대금(억)", 1, 5000, 20, step=5)
     sc_days = f[4].number_input("수급 집계일", 5, 60, 20, step=5)
+    f2 = st.columns([1, 1, 3])
+    k200_only = f2[0].checkbox("코스피200만", value=False,
+                               help="기관 매수 대상이자 유동성 하한 역할을 합니다.")
+    max_short = f2[1].number_input("공매도 잔고 상한(%)", 0.5, 100.0, 100.0, step=0.5,
+                                   help="잔고 비중이 높은 종목을 제외합니다. 100 이면 미적용.")
 
     is_tech = mode in TECH_MODES
     if is_tech:
@@ -2617,7 +2800,8 @@ with tab_screen:
             with st.spinner("시장 전체 스냅샷을 수집하는 중… (8회 호출)"):
                 uni = load_universe(int(sc_days), 60, krx_id)
             res = screen_stocks(uni, "낙폭과대 반등" if is_tech else mode,
-                                int(min_cap), int(min_val))
+                                int(min_cap), int(min_val),
+                                k200_only=k200_only, max_short=float(max_short))
             tech_map = {}
             if is_tech and not res.empty:
                 cands = tuple(res.sort_values("수급강도", ascending=False)
@@ -2649,10 +2833,10 @@ with tab_screen:
             f"→ 상위 {len(picks)}종목 · 전략 '{sc['mode']}' · 수급 집계 {sc['days']}일"
         )
 
-        cols_base = ["종목명", "기회점수", "종가", "시가총액", "PBR",
+        cols_base = ["종목명", "업종", "기회점수", "종가", "시가총액", "PBR",
                      "순매수_기타법인", "순매수_외국인", "순매수_연기금",
                      "매수주체수", "거래대금"]
-        names_base = ["종목명", "점수", "종가", "시총(억)", "PBR",
+        names_base = ["종목명", "업종", "점수", "종가", "시총(억)", "PBR",
                       "기타법인(억)", "외국인(억)", "연기금(억)", "매수주체", "거래대금(억)"]
         fmt = {"점수": "{:.0f}", "종가": "{:,.0f}", "시총(억)": "{:,.0f}", "PBR": "{:.2f}",
                "기타법인(억)": "{:+,.0f}", "외국인(억)": "{:+,.0f}", "연기금(억)": "{:+,.0f}",
@@ -2666,6 +2850,11 @@ with tab_screen:
             cols_base += ["단기등락률", "장기등락률"]
             names_base += [f"{sc['days']}일%", "60일%"]
             fmt.update({f"{sc['days']}일%": "{:+.1f}", "60일%": "{:+.1f}"})
+        for src_, nm_, f_ in [("공매도비중", "공매도잔고%", "{:.2f}"),
+                              ("공매도거래비중", "공매도거래%", "{:.1f}"),
+                              ("외국인지분율", "외인지분%", "{:.1f}")]:
+            if src_ in picks.columns:
+                cols_base.append(src_); names_base.append(nm_); fmt[nm_] = f_
         view = picks[cols_base].copy()
         view.columns = names_base
         view.insert(0, "순위", range(1, len(view) + 1))
@@ -2772,6 +2961,21 @@ with tab_screen:
             st.bar_chart(fl[cols_f], color=SERIES_COLORS[:len(cols_f)], height=260)
             st.markdown("**기간 누적**")
             st.area_chart(fl[cols_f].cumsum(), color=SERIES_COLORS[:len(cols_f)], height=220)
+            try:
+                sh = load_stock_short(dtick, 60, krx_id)
+                if "잔고비중(%)" in sh.columns and sh["잔고비중(%)"].notna().any():
+                    ser = sh["잔고비중(%)"].dropna()
+                    cur, prv = float(ser.iloc[-1]), float(ser.iloc[0])
+                    st.markdown("**공매도 잔고 비중 추이 (%)**")
+                    st.caption("수급이 들어와도 공매도 잔고가 같이 늘고 있다면 "
+                               "매수 신호를 정면으로 반박하는 증거입니다.")
+                    st.line_chart(sh[["잔고비중(%)"]],
+                                  color=[C_DOWN if cur > prv else C_UP], height=200)
+                    st.markdown(kpi("공매도 잔고 비중", f"{cur:.2f}%",
+                                    f"60일 전 {prv:.2f}% → {'증가' if cur > prv else '감소'}",
+                                    C_DOWN if cur > prv else C_UP), unsafe_allow_html=True)
+            except Exception as e:  # noqa: BLE001
+                st.caption(f"공매도 잔고 조회 실패: {type(e).__name__}")
 
         st.download_button("후보 CSV 내려받기",
                            data=view.to_csv().encode("utf-8-sig"),
@@ -2962,6 +3166,26 @@ with tab_plan:
                     "손익분기(%)": "{:.3f}", "거래대금(억)": "{:,.0f}"}, na_rep="—"),
                 use_container_width=True, height=min(460, 60 + 36 * len(view)))
 
+            try:
+                conc = sector_concentration(plan, load_sector_map(krx_id))
+                if not conc.empty:
+                    st.markdown("**업종 분산**")
+                    top_w = float(conc["비중(%)"].iloc[0])
+                    st.dataframe(
+                        conc.style.format({"금액": "{:,.0f}", "리스크": "{:,.0f}",
+                                           "비중(%)": "{:.1f}", "종목수": "{:.0f}"}),
+                        use_container_width=True, height=min(260, 60 + 36 * len(conc)))
+                    if top_w > 40:
+                        st.error(
+                            f"'{conc.index[0]}' 업종에 투입액의 {top_w:.0f}% 가 몰려 있습니다. "
+                            "같은 업종은 같은 악재에 함께 빠집니다. 종목 수가 많다고 분산이 "
+                            "되는 것이 아닙니다.", icon="🧮")
+                    elif top_w > 25:
+                        st.warning(f"'{conc.index[0]}' 업종 비중 {top_w:.0f}%. "
+                                   "업종 뉴스 하나에 계획 전체가 흔들릴 수 있습니다.", icon="⚠️")
+            except Exception as e:  # noqa: BLE001
+                log_exc("섹터", e, "업종 분산 계산 실패")
+
             binding = plan["제약"].value_counts()
             st.caption("크기를 결정한 제약: " +
                        " · ".join(f"{k_} {v_}종목" for k_, v_ in binding.items()))
@@ -3102,6 +3326,99 @@ with tab_watch:
                            file_name=f"watch_{now_kst():%Y%m%d}.csv", mime="text/csv")
     else:
         st.caption("종목코드를 입력하고 조회를 누르세요. 종목당 2회 호출이라 15개면 30회입니다.")
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 섹터 · 밸류에이션 탭
+# ──────────────────────────────────────────────────────────────────────────────
+
+with tab_sector:
+    st.markdown("### 시장 밸류에이션")
+    st.markdown("코스피 자체의 PER·PBR 이 역사적으로 어디쯤인지 봅니다. "
+                "수급이 언제 돌아올지는 몰라도, 지금이 비싼지 싼지는 알 수 있습니다.")
+
+    vc = st.columns([1, 3])
+    v_years = vc[0].selectbox("조회 기간", [1, 3, 5, 10], index=1,
+                              format_func=lambda x: f"{x}년")
+    if vc[1].button("밸류에이션 조회", type="primary"):
+        try:
+            with st.spinner("코스피 지수 밸류에이션을 불러오는 중…"):
+                st.session_state["val"] = load_index_valuation(int(v_years), krx_id)
+        except Exception as e:  # noqa: BLE001
+            log_exc("밸류", e, "조회 실패")
+            st.error(f"조회 실패 — {type(e).__name__}: {e}")
+
+    val = st.session_state.get("val")
+    if val is not None and not val.empty:
+        cols_v = [c for c in ["PER", "PBR", "배당수익률"] if c in val.columns]
+        kc = st.columns(max(1, len(cols_v)))
+        for i_, c_ in enumerate(cols_v):
+            p = valuation_percentile(val[c_])
+            if not p:
+                continue
+            if c_ == "배당수익률":
+                tone = C_UP if p["백분위"] > 70 else C_DOWN if p["백분위"] < 30 else C_ACCENT
+            else:
+                tone = C_UP if p["백분위"] < 30 else C_DOWN if p["백분위"] > 70 else C_ACCENT
+            kc[i_].markdown(
+                kpi(f"코스피 {c_}", f"{p['현재']:.2f}",
+                    f"{v_years}년 백분위 {p['백분위']:.0f}% · "
+                    f"범위 {p['최저']:.2f}~{p['최고']:.2f}", tone),
+                unsafe_allow_html=True)
+        for c_ in cols_v:
+            st.markdown(f"**코스피 {c_} 추이**")
+            st.line_chart(val[[c_]], color=[C_ACCENT], height=200)
+        st.caption("백분위가 낮다 = 과거 대비 싸다. 다만 싼 것이 더 싸질 수 있고, "
+                   "이익이 줄면 가격이 빠져도 PER 은 오릅니다.")
+    else:
+        st.caption("버튼을 눌러 조회하세요. KRX 호출 1회입니다.")
+
+    st.divider()
+    st.markdown("### 업종별 자금 흐름")
+    st.markdown("어느 업종으로 돈이 들어가고 있는지 봅니다. "
+                "스크리너가 이미 받아온 데이터로 집계하므로 추가 호출이 없습니다.")
+
+    uni_ = None
+    if st.session_state.get("screen"):
+        try:
+            uni_ = load_universe(int(st.session_state["screen"]["days"]), 60, krx_id)
+        except Exception as e:  # noqa: BLE001
+            log_exc("섹터", e, "유니버스 재사용 실패")
+
+    if uni_ is None:
+        st.info("종목 스크리너를 먼저 실행하면 업종 집계가 나타납니다.", icon="🗂")
+    else:
+        rot = sector_rotation(uni_)
+        if rot.empty:
+            st.warning("업종 데이터를 결합하지 못했습니다. 진단 탭 로그를 확인하세요.")
+        else:
+            fmt_r = {"종목수": "{:.0f}", "시총합(조)": "{:,.1f}",
+                     "단기등락률(%)": "{:+.2f}", "장기등락률(%)": "{:+.2f}",
+                     "PBR중앙값": "{:.2f}", "외국인강도(%)": "{:+.3f}",
+                     "공매도잔고(%)": "{:.2f}"}
+            for c_ in rot.columns:
+                if c_.endswith("(억)"):
+                    fmt_r[c_] = "{:+,.0f}"
+            st.dataframe(rot.style.format(fmt_r, na_rep="—"),
+                         use_container_width=True, height=min(520, 60 + 34 * len(rot)))
+
+            if "외국인강도(%)" in rot.columns:
+                a_, b_ = st.columns(2)
+                with a_:
+                    st.markdown("**외국인 순매수 강도 상위 8 업종**")
+                    st.bar_chart(rot["외국인강도(%)"].head(8), color=[C_UP], height=260)
+                with b_:
+                    st.markdown("**하위 8 업종**")
+                    st.bar_chart(rot["외국인강도(%)"].tail(8), color=[C_DOWN], height=260)
+                st.caption("금액이 아니라 시총 대비 비율입니다. 금액으로 줄 세우면 "
+                           "전기전자 같은 대형 업종만 계속 1등이라 정보가 없습니다.")
+
+            st.markdown("**업종 중앙값 등락률**")
+            st.bar_chart(rot[["단기등락률(%)", "장기등락률(%)"]].sort_values("장기등락률(%)"),
+                         color=[C_ACCENT, C_MUTED], height=300)
+            st.download_button("업종 집계 CSV", data=rot.to_csv().encode("utf-8-sig"),
+                               file_name=f"sector_{now_kst():%Y%m%d}.csv", mime="text/csv")
 
 
 st.divider()
