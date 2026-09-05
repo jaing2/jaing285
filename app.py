@@ -1585,8 +1585,6 @@ EXEC_PERSONAS = [
 ]
 
 
-# 판단 5인 + 실행 5인
-ALL_PERSONAS = PERSONAS + EXEC_PERSONAS
 
 
 def exec_context(plan: pd.DataFrame, capital: float, gate: float, gate_label: str,
@@ -1608,6 +1606,289 @@ def exec_context(plan: pd.DataFrame, capital: float, gate: float, gate_label: st
 - 총 리스크(전 종목 손절 시) {total_risk/1e4:,.0f}만원 (계좌의 {total_risk/capital*100:.2f}%)
 {lines}
 """
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 기술적 지표
+# ──────────────────────────────────────────────────────────────────────────────
+
+MA_SET = (5, 20, 60, 120)
+TECH_MODES = ["역배열→정배열 전환", "MACD 골든크로스", "RSI 과매도 반등"]
+ALL_MODES = ["낙폭과대 반등", "추세 지속"] + TECH_MODES
+
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder 방식 RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    ag = gain.ewm(alpha=1 / period, adjust=False).mean()
+    al = loss.ewm(alpha=1 / period, adjust=False).mean()
+    out = 100 - 100 / (1 + ag.div(al))
+    # 0 나눗셈 경계 처리: 손실 없음→100, 이익 없음→0, 둘 다 없음(보합)→50
+    out = out.where(al != 0, 100.0)
+    out = out.where(ag != 0, 0.0)
+    out = out.where(~((ag == 0) & (al == 0)), 50.0)
+    return out.astype(float)
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9):
+    line = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    signal = line.ewm(span=sig, adjust=False).mean()
+    return line, signal, line - signal
+
+
+def compute_tech(close: pd.Series, volume: Optional[pd.Series] = None) -> dict:
+    """
+    한 종목의 종가 시계열에서 배열 상태와 지표를 계산합니다.
+    이동평균·MACD 는 모두 후행 지표입니다. 전환을 '예측'하는 것이 아니라
+    '이미 일어난 전환을 확인'하는 용도로 씁니다.
+    """
+    if len(close) < 130:
+        return {}
+    ma = {n: close.rolling(n).mean() for n in MA_SET}
+    m5, m20, m60, m120 = (ma[n] for n in MA_SET)
+
+    bull = (m5 > m20) & (m20 > m60) & (m60 > m120)      # 정배열
+    bear = (m5 < m20) & (m20 < m60) & (m60 < m120)      # 역배열
+
+    line, signal, hist = macd(close)
+    r = rsi(close)
+    last = close.index[-1]
+
+    def at(s, i=-1):
+        try:
+            v = float(s.iloc[i])
+            return v if pd.notna(v) else float("nan")
+        except Exception:  # noqa: BLE001
+            return float("nan")
+
+    # 정배열이 몇 단계까지 회복됐는지 (0~3)
+    steps = int(at(m5) > at(m20)) + int(at(m20) > at(m60)) + int(at(m60) > at(m120))
+    # 최근 60일 중 역배열이었던 비율 — 진짜 바닥에서 올라오는 것인지 확인
+    bear_ratio = float(bear.tail(60).mean())
+    # MACD 히스토그램이 음→양으로 바뀐 지 며칠 됐는가
+    h = hist.dropna()
+    cross_age = float("nan")
+    if len(h) > 2:
+        pos = h > 0
+        if bool(pos.iloc[-1]):
+            flip = pos[::-1].idxmin() if (~pos).any() else None
+            if flip is not None:
+                cross_age = float(len(h.loc[flip:]) - 1)
+    # MA20 기울기 (5일 변화율 %)
+    slope20 = ((at(m20) / at(m20, -6) - 1) * 100) if len(m20.dropna()) > 6 else float("nan")
+
+    state = "정배열" if bool(bull.iloc[-1]) else "역배열" if bool(bear.iloc[-1]) else "혼조"
+
+    return {
+        "종가": at(close), "MA5": at(m5), "MA20": at(m20), "MA60": at(m60), "MA120": at(m120),
+        "배열": state, "정배열단계": steps, "역배열비율60": round(bear_ratio, 2),
+        "MA20기울기": slope20, "이격도60": (at(close) / at(m60) - 1) * 100 if at(m60) else float("nan"),
+        "MACD": at(line), "MACD시그널": at(signal), "MACD히스토": at(hist),
+        "MACD전환일": cross_age, "RSI": at(r),
+        "RSI최저20": float(r.tail(20).min()) if len(r.dropna()) > 20 else float("nan"),
+        "거래량비": (float(volume.tail(5).mean() / volume.tail(60).mean())
+                  if volume is not None and len(volume) > 60 and volume.tail(60).mean() else float("nan")),
+        "기준일": last,
+        "series": {"close": close, "ma": ma, "macd": (line, signal, hist), "rsi": r},
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_price_matrix(tickers: tuple, days: int, auth_key: str) -> dict:
+    """
+    후보 종목만 골라 개별 OHLCV 를 조회합니다.
+    전종목을 날짜별로 224회 부르는 대신, 1단계에서 걸러낸 소수만 종목별로 부릅니다.
+    """
+    stock = get_stock_api()
+    end = _latest_bday()
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(days * 1.55) + 20)).strftime("%Y%m%d")
+    log("기술적", "개별 시세 조회 시작", 종목수=len(tickers), 기간=f"{start}~{end}")
+
+    out, fails = {}, 0
+    prog = st.progress(0.0, text="개별 종목 시세를 불러오는 중…")
+    for i, t in enumerate(tickers):
+        try:
+            with capture_stdout("기술적"):
+                d = _retry(lambda: stock.get_market_ohlcv(start, end, t), "기술적", tries=2)
+            if d is not None and not d.empty:
+                d = d.copy()
+                d.index = pd.to_datetime(d.index)
+                cc = _pick(d.columns, "종가")
+                vc = _pick(d.columns, "거래량")
+                if cc is not None:
+                    out[t] = {
+                        "close": pd.to_numeric(d[cc], errors="coerce").dropna(),
+                        "volume": pd.to_numeric(d[vc], errors="coerce") if vc else None,
+                        "ohlc": d,
+                    }
+        except Exception:  # noqa: BLE001
+            fails += 1
+        prog.progress((i + 1) / len(tickers), text=f"{i+1}/{len(tickers)} 종목")
+        time.sleep(0.12)          # KRX 부하 완화
+    prog.empty()
+    log("기술적", "개별 시세 조회 완료", 성공=len(out), 실패=fails)
+    return out
+
+
+def screen_with_tech(base: pd.DataFrame, tech: dict, mode: str) -> pd.DataFrame:
+    """1단계 수급 필터를 통과한 종목에 기술적 조건을 더해 재채점합니다."""
+    rows = []
+    for t, r in base.iterrows():
+        m = tech.get(t)
+        if not m:
+            continue
+        rows.append({**r.to_dict(), "티커": t,
+                     **{k: v for k, v in m.items() if k != "series"}})
+    if not rows:
+        return pd.DataFrame()
+    d = pd.DataFrame(rows).set_index("티커")
+
+    pct = lambda s: s.rank(pct=True) * 100  # noqa: E731
+    flow = pct(d["수급강도"]) * 0.25 + (d["매수주체수"] / 4 * 100) * 0.10
+
+    if mode == "역배열→정배열 전환":
+        # 바닥에서 올라오는 중인가: 과거 역배열 + 현재 단계적 회복
+        score = flow
+        score += d["역배열비율60"] * 100 * 0.15          # 최근까지 역배열이었을 것
+        score += (d["정배열단계"] / 3 * 100) * 0.20      # 지금 몇 단계 회복했나
+        score += pct(d["MA20기울기"]) * 0.15             # MA20 이 상승 전환했나
+        score += (d["종가"] > d["MA60"]).astype(int) * 100 * 0.15   # 60일선 회복
+        d["기술판정"] = d.apply(
+            lambda x: f"{x['배열']} · {int(x['정배열단계'])}/3단계 회복 · MA20 {x['MA20기울기']:+.1f}%", axis=1)
+    elif mode == "MACD 골든크로스":
+        fresh = d["MACD전환일"].fillna(999)
+        score = flow
+        score += (fresh <= 5).astype(int) * 100 * 0.25   # 5일 이내 골든크로스
+        score += (fresh <= 15).astype(int) * 100 * 0.10
+        score += pct(d["MACD히스토"]) * 0.15
+        score += (d["종가"] > d["MA20"]).astype(int) * 100 * 0.15
+        d["기술판정"] = d.apply(
+            lambda x: (f"골든크로스 {int(x['MACD전환일'])}일 전"
+                       if pd.notna(x["MACD전환일"]) else "히스토 음수") + f" · {x['배열']}", axis=1)
+    else:  # RSI 과매도 반등
+        score = flow
+        score += (1 - d["RSI최저20"].rank(pct=True)) * 100 * 0.20    # 최근 깊게 눌렸던 종목
+        score += ((d["RSI"] > 30) & (d["RSI"] < 55)).astype(int) * 100 * 0.20  # 반등 초입
+        score += pct(d["RSI"] - d["RSI최저20"]) * 0.15               # 저점 대비 회복폭
+        score += (d["MACD히스토"] > 0).astype(int) * 100 * 0.10
+        d["기술판정"] = d.apply(
+            lambda x: f"RSI {x['RSI']:.0f} (20일 저점 {x['RSI최저20']:.0f}) · {x['배열']}", axis=1)
+
+    d["기회점수"] = score.round(1)
+    return d.sort_values("기회점수", ascending=False)
+
+
+def tech_scenario(row: pd.Series, mode: str) -> dict:
+    reasons, checks = [], []
+    for inv in ["기타법인", "외국인", "연기금"]:
+        v = row.get(f"순매수_{inv}", 0)
+        if v > 0:
+            reasons.append(f"{inv} 순매수 {v:,.0f}억 (시총 대비 {row.get(f'강도_{inv}', 0):.2f}%)")
+
+    ma_txt = (f"MA5 {row['MA5']:,.0f} / MA20 {row['MA20']:,.0f} / "
+              f"MA60 {row['MA60']:,.0f} / MA120 {row['MA120']:,.0f}")
+    reasons.append(f"배열 {row['배열']} · {ma_txt}")
+    reasons.append(f"RSI {row['RSI']:.0f} · MACD 히스토 {row['MACD히스토']:+,.0f}")
+    if pd.notna(row.get("거래량비")) and row["거래량비"] > 1.2:
+        reasons.append(f"최근 5일 거래량이 60일 평균의 {row['거래량비']:.1f}배")
+
+    if mode == "역배열→정배열 전환":
+        reasons.append(f"최근 60일 중 {row['역배열비율60']*100:.0f}% 가 역배열 → 바닥권에서 회복 시도")
+        bull = (f"MA5 가 MA20 을 넘은 뒤 MA20 이 MA60 을 상향 돌파하면 정배열 완성. "
+                f"현재 {int(row['정배열단계'])}/3 단계. 남은 단계가 채워지는지가 관건.")
+        entry = f"MA20({row['MA20']:,.0f}) 눌림에서 분할 진입, 정배열 완성 시 추가."
+        invalid = f"MA5 가 MA20 아래로 재이탈하거나 MA60({row['MA60']:,.0f}) 하회 시 전환 실패로 간주."
+    elif mode == "MACD 골든크로스":
+        age = row["MACD전환일"]
+        reasons.append(f"MACD 골든크로스 {int(age)}일 경과" if pd.notna(age) else "MACD 히스토 음수 구간")
+        bull = "히스토그램이 계속 확대되면 모멘텀 지속. 축소 전환 시 되돌림 경계."
+        entry = f"현재가 {row['종가']:,.0f}원. 히스토그램 확대 확인 후 진입."
+        invalid = "히스토그램이 다시 음수로 전환되면 무효 (통상 데드크로스 선행 신호)."
+    else:
+        bull = f"RSI 가 20일 저점 {row['RSI최저20']:.0f} 에서 {row['RSI']:.0f} 까지 회복. 50 돌파 시 추세 전환 확인."
+        entry = f"현재가 {row['종가']:,.0f}원. RSI 50 상향 돌파를 확인 신호로."
+        invalid = f"RSI 가 20일 저점 {row['RSI최저20']:.0f} 아래로 재하락 시 무효."
+
+    checks.append("이 지표들은 모두 후행 지표입니다 — 이미 일어난 움직임의 확인일 뿐입니다")
+    if row.get("순매수_기타법인", 0) > 0:
+        checks.append("DART 자기주식취득 공시 대조")
+    checks.append("직전 실적·적자 여부·유상증자 공시 확인")
+    checks.append(f"거래대금 {row['거래대금']:,.0f}억 — 체결 가능 규모인지")
+    return {"reasons": reasons, "bull": bull, "entry": entry,
+            "invalid": invalid, "checks": checks}
+
+
+def tech_figure(ticker: str, name: str, hist: dict, tech: dict):
+    """개별 종목 캔들 + 이동평균 + MACD + RSI."""
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+
+    ohlc = hist["ohlc"].tail(160)
+    s = tech["series"]
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                        row_heights=[0.56, 0.22, 0.22])
+
+    o, h, l, c = (_pick(ohlc.columns, x) for x in ("시가", "고가", "저가", "종가"))
+    fig.add_trace(go.Candlestick(
+        x=ohlc.index, open=ohlc[o], high=ohlc[h], low=ohlc[l], close=ohlc[c], name=name,
+        increasing=dict(line=dict(color=C_UP, width=1), fillcolor=C_UP),
+        decreasing=dict(line=dict(color=C_DOWN, width=1), fillcolor=C_DOWN)), row=1, col=1)
+    for n, col in zip(MA_SET, ["#E6EDF3", C_ACCENT, "#30A46C", "#8E4EC6"]):
+        fig.add_trace(go.Scatter(x=ohlc.index, y=s["ma"][n].reindex(ohlc.index),
+                                 name=f"MA{n}", mode="lines",
+                                 line=dict(color=col, width=1.2)), row=1, col=1)
+
+    line, signal, histo = s["macd"]
+    fig.add_trace(go.Bar(x=ohlc.index, y=histo.reindex(ohlc.index), name="히스토",
+                         marker_color=[C_UP if v > 0 else C_DOWN
+                                       for v in histo.reindex(ohlc.index).fillna(0)],
+                         marker_line_width=0, opacity=.6), row=2, col=1)
+    fig.add_trace(go.Scatter(x=ohlc.index, y=line.reindex(ohlc.index), name="MACD",
+                             line=dict(color="#E6EDF3", width=1.2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=ohlc.index, y=signal.reindex(ohlc.index), name="시그널",
+                             line=dict(color=C_ACCENT, width=1.2)), row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=ohlc.index, y=s["rsi"].reindex(ohlc.index), name="RSI",
+                             line=dict(color="#8E4EC6", width=1.4)), row=3, col=1)
+    for y_, cc_ in [(70, C_UP), (50, C_MUTED), (30, C_DOWN)]:
+        fig.add_hline(y=y_, line=dict(color=cc_, width=.8, dash="dot"), row=3, col=1)
+
+    missing = [d for d in pd.date_range(ohlc.index.min(), ohlc.index.max(), freq="D")
+               .difference(ohlc.index)]
+    if missing:
+        fig.update_xaxes(rangebreaks=[dict(values=missing)])
+    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(0,0,0,0)", font=dict(color=C_TEXT, size=11),
+                      height=680, margin=dict(l=8, r=8, t=30, b=8),
+                      xaxis_rangeslider_visible=False, hovermode="x unified",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0,
+                                  bgcolor="rgba(0,0,0,0)"))
+    grid = "rgba(255,255,255,.06)"
+    fig.update_xaxes(showgrid=True, gridcolor=grid)
+    fig.update_yaxes(showgrid=True, gridcolor=grid, zeroline=False)
+    fig.update_yaxes(title_text="주가", row=1, col=1)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    return fig
+
+
+CHART_PERSONA = {
+    "name": "차트 분석가", "icon": "🕯",
+    "system": "당신은 이동평균 배열, MACD, RSI, 거래량으로 판단하는 기술적 분석가입니다. "
+              "당신은 이 지표들이 모두 후행 지표라는 것을 알고 있습니다. 따라서 '예측'이라는 "
+              "말을 쓰지 않고 '확인'과 '조건'으로만 서술합니다. 배열 전환은 완성되기 전까지 "
+              "실패할 수 있다는 것을 전제하며, 항상 무효화 가격을 함께 제시합니다.",
+    "task": "제시된 종목의 이동평균 배열 단계, MACD 히스토그램, RSI 위치를 근거로 "
+            "차트 국면을 판정하십시오. 전환이 완성된 종목과 아직 시도 중인 종목을 구분하고, "
+            "각각에 대해 확인 신호와 무효화 가격을 제시하십시오. "
+            "지표가 후행한다는 점이 이 판단에 어떤 한계를 만드는지도 한 문장으로 밝히십시오.",
+}
+
+
+# 판단 5인 + 실행 5인 + 차트 1인
+ALL_PERSONAS = PERSONAS + EXEC_PERSONAS + [CHART_PERSONA]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2055,21 +2336,46 @@ with tab_screen:
     )
 
     f = st.columns(5)
-    mode = f[0].selectbox("전략", ["낙폭과대 반등", "추세 지속"])
+    mode = f[0].selectbox("전략", ALL_MODES,
+                          help="뒤 3개는 개별 종목 시세를 추가로 조회합니다(2단계).")
     n_pick = f[1].number_input("종목 수", 5, 30, 10, step=1)
     min_cap = f[2].number_input("최소 시총(억)", 500, 100000, 3000, step=500)
     min_val = f[3].number_input("최소 거래대금(억)", 1, 5000, 20, step=5)
     sc_days = f[4].number_input("수급 집계일", 5, 60, 20, step=5)
 
+    is_tech = mode in TECH_MODES
+    if is_tech:
+        t1, t2 = st.columns([1, 3])
+        cand_n = t1.number_input("2단계 후보 수", 20, 120, 50, step=10,
+                                 help="1단계 수급 상위 N종목만 개별 시세를 조회합니다.")
+        t2.caption(f"KRX 호출 = 8회(전종목 스냅샷) + {int(cand_n)}회(개별 시세). "
+                   f"약 {int(cand_n)*0.4/60:.0f}~{int(cand_n)*0.9/60:.0f}분 소요 · 1시간 캐시")
+    else:
+        cand_n = 0
+
     if st.button("종목 스크리닝 실행", type="primary"):
         try:
             with st.spinner("시장 전체 스냅샷을 수집하는 중… (8회 호출)"):
                 uni = load_universe(int(sc_days), 60, krx_id)
-            res = screen_stocks(uni, mode, int(min_cap), int(min_val))
+            res = screen_stocks(uni, "낙폭과대 반등" if is_tech else mode,
+                                int(min_cap), int(min_val))
+            tech_map = {}
+            if is_tech and not res.empty:
+                cands = tuple(res.sort_values("수급강도", ascending=False)
+                              .head(int(cand_n)).index)
+                hist = load_price_matrix(cands, 224, krx_id)
+                for t_, h_ in hist.items():
+                    m_ = compute_tech(h_["close"], h_.get("volume"))
+                    if m_:
+                        tech_map[t_] = m_
+                st.session_state["hist"] = hist
+                st.session_state["tech"] = tech_map
+                res = screen_with_tech(res.loc[[c for c in cands if c in tech_map]],
+                                       tech_map, mode)
             st.session_state["screen"] = {
                 "res": res, "mode": mode, "n": int(n_pick),
                 "days": int(sc_days), "base": uni["기준일"].iloc[0] if len(uni) else "",
-                "universe_n": len(uni), "filtered_n": len(res),
+                "universe_n": len(uni), "filtered_n": len(res), "tech": is_tech,
             }
         except Exception as e:  # noqa: BLE001
             log_exc("스크리너", e, "스크리닝 실패")
@@ -2084,26 +2390,36 @@ with tab_screen:
             f"→ 상위 {len(picks)}종목 · 전략 '{sc['mode']}' · 수급 집계 {sc['days']}일"
         )
 
-        view = picks[["종목명", "기회점수", "종가", "시가총액", "PBR", "PER",
-                      "단기등락률", "장기등락률", "순매수_기타법인", "순매수_외국인",
-                      "순매수_연기금", "매수주체수", "거래대금"]].copy()
-        view.columns = ["종목명", "점수", "종가", "시총(억)", "PBR", "PER",
-                        f"{sc['days']}일%", "60일%", "기타법인(억)", "외국인(억)",
-                        "연기금(억)", "매수주체", "거래대금(억)"]
-        st.dataframe(
-            view.style.format({
-                "점수": "{:.0f}", "종가": "{:,.0f}", "시총(억)": "{:,.0f}",
-                "PBR": "{:.2f}", "PER": "{:.1f}",
-                f"{sc['days']}일%": "{:+.1f}", "60일%": "{:+.1f}",
-                "기타법인(억)": "{:+,.0f}", "외국인(억)": "{:+,.0f}", "연기금(억)": "{:+,.0f}",
-                "매수주체": "{:.0f}", "거래대금(억)": "{:,.0f}"}, na_rep="—"),
-            use_container_width=True, height=min(460, 60 + 36 * len(view)))
+        cols_base = ["종목명", "기회점수", "종가", "시가총액", "PBR",
+                     "순매수_기타법인", "순매수_외국인", "순매수_연기금",
+                     "매수주체수", "거래대금"]
+        names_base = ["종목명", "점수", "종가", "시총(억)", "PBR",
+                      "기타법인(억)", "외국인(억)", "연기금(억)", "매수주체", "거래대금(억)"]
+        fmt = {"점수": "{:.0f}", "종가": "{:,.0f}", "시총(억)": "{:,.0f}", "PBR": "{:.2f}",
+               "기타법인(억)": "{:+,.0f}", "외국인(억)": "{:+,.0f}", "연기금(억)": "{:+,.0f}",
+               "매수주체": "{:.0f}", "거래대금(억)": "{:,.0f}"}
+        if sc.get("tech"):
+            cols_base += ["배열", "정배열단계", "RSI", "MACD히스토", "MA20기울기", "이격도60"]
+            names_base += ["배열", "단계", "RSI", "MACD히스토", "MA20기울기%", "60일이격%"]
+            fmt.update({"단계": "{:.0f}", "RSI": "{:.0f}", "MACD히스토": "{:+,.0f}",
+                        "MA20기울기%": "{:+.1f}", "60일이격%": "{:+.1f}"})
+        else:
+            cols_base += ["단기등락률", "장기등락률"]
+            names_base += [f"{sc['days']}일%", "60일%"]
+            fmt.update({f"{sc['days']}일%": "{:+.1f}", "60일%": "{:+.1f}"})
+        view = picks[cols_base].copy()
+        view.columns = names_base
+        st.dataframe(view.style.format(fmt, na_rep="—"),
+                     use_container_width=True, height=min(460, 60 + 36 * len(view)))
 
         st.markdown("#### 포착 근거와 시나리오")
         for ticker, row in picks.iterrows():
-            sc_dict = build_scenario(row, sc["mode"], sc["days"], 60)
+            sc_dict = (tech_scenario(row, sc["mode"]) if sc.get("tech")
+                       else build_scenario(row, sc["mode"], sc["days"], 60))
+            tail = (f"{row['배열']} · RSI {row['RSI']:.0f}" if sc.get("tech")
+                    else f"60일 {row['장기등락률']:+.1f}%")
             head = (f"{row['종목명']} ({ticker}) · 점수 {row['기회점수']:.0f} · "
-                    f"{row['종가']:,.0f}원 · 60일 {row['장기등락률']:+.1f}%")
+                    f"{row['종가']:,.0f}원 · {tail}")
             with st.expander(head):
                 a, b = st.columns([1, 1])
                 with a:
@@ -2120,6 +2436,17 @@ with tab_screen:
                     st.markdown("**직접 확인할 것**")
                     for c_ in sc_dict["checks"]:
                         st.markdown(f"- {c_}")
+                if sc.get("tech"):
+                    hm = st.session_state.get("hist", {}).get(ticker)
+                    tm = st.session_state.get("tech", {}).get(ticker)
+                    if hm and tm:
+                        try:
+                            st.plotly_chart(tech_figure(ticker, row["종목명"], hm, tm),
+                                            use_container_width=True,
+                                            config={"displaylogo": False},
+                                            key=f"tf_{ticker}")
+                        except Exception as e:  # noqa: BLE001
+                            st.caption(f"차트 생성 실패: {e}")
 
         st.download_button("후보 CSV 내려받기",
                            data=view.to_csv().encode("utf-8-sig"),
