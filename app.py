@@ -1345,6 +1345,272 @@ def run_synthesis(api_key: str, model: str, context: str, opinions: dict):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 리스크 엔진 — 실전 매매의 실제 핵심
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 시장 스코어 → 신규 진입 허용 배율. 종목이 아무리 좋아 보여도 국면이 나쁘면 줄입니다.
+MARKET_GATE = [(85, 1.00, "정상 배분"), (65, 0.75, "배분 25% 축소"),
+               (45, 0.50, "절반 배분"), (25, 0.25, "테스트 물량만"),
+               (0, 0.00, "신규 진입 중단")]
+
+
+def market_gate(score: int) -> tuple[float, str]:
+    for lo, mult, label in MARKET_GATE:
+        if score >= lo:
+            return mult, label
+    return 0.0, "신규 진입 중단"
+
+
+def size_position(price: float, capital: float, risk_pct: float, stop_pct: float,
+                  max_weight_pct: float, adv_eok: float, adv_cap_pct: float,
+                  gate: float) -> dict:
+    """
+    포지션 크기를 세 가지 제약 중 가장 작은 값으로 정합니다.
+      1) 리스크 한도  — 손절까지 갔을 때 잃는 금액이 계좌의 risk_pct 를 넘지 않을 것
+      2) 비중 한도    — 한 종목이 계좌의 max_weight_pct 를 넘지 않을 것
+      3) 유동성 한도  — 주문금액이 일평균 거래대금의 adv_cap_pct 를 넘지 않을 것
+    셋 중 무엇이 걸렸는지도 함께 돌려줍니다.
+    """
+    if price <= 0 or stop_pct <= 0:
+        return {"수량": 0, "금액": 0.0, "제약": "가격/손절 입력 오류"}
+
+    risk_krw = capital * risk_pct / 100
+    by_risk = risk_krw / (stop_pct / 100)
+    by_weight = capital * max_weight_pct / 100
+    by_liquidity = adv_eok * 1e8 * adv_cap_pct / 100
+
+    limits = {"리스크 한도": by_risk, "비중 한도": by_weight, "유동성 한도": by_liquidity}
+    binding = min(limits, key=limits.get)
+    value = min(limits.values()) * gate
+
+    shares = int(value // price)
+    actual = shares * price
+    return {
+        "수량": shares,
+        "금액": actual,
+        "실제리스크": actual * stop_pct / 100,
+        "계좌대비": actual / capital * 100 if capital else 0.0,
+        "제약": binding if gate > 0 else "국면 게이트 (신규 진입 중단)",
+        "게이트배율": gate,
+        "한도": limits,
+    }
+
+
+def trade_costs(value: float, fee_pct: float, tax_pct: float) -> dict:
+    """왕복 비용. 매수 수수료 + 매도 수수료 + 매도 시 거래세."""
+    buy_fee = value * fee_pct / 100
+    sell_fee = value * fee_pct / 100
+    tax = value * tax_pct / 100
+    total = buy_fee + sell_fee + tax
+    return {"매수수수료": buy_fee, "매도수수료": sell_fee, "거래세": tax, "합계": total,
+            "손익분기(%)": (total / value * 100) if value else 0.0}
+
+
+def build_trade_plan(picks: pd.DataFrame, capital: float, risk_pct: float, stop_pct: float,
+                     max_weight_pct: float, adv_cap_pct: float, fee_pct: float,
+                     tax_pct: float, gate: float, target_r: float) -> pd.DataFrame:
+    rows = []
+    for ticker, r in picks.iterrows():
+        sz = size_position(float(r["종가"]), capital, risk_pct, stop_pct,
+                           max_weight_pct, float(r["거래대금"]), adv_cap_pct, gate)
+        if sz["수량"] <= 0:
+            continue
+        cost = trade_costs(sz["금액"], fee_pct, tax_pct)
+        stop_price = r["종가"] * (1 - stop_pct / 100)
+        target_price = r["종가"] * (1 + stop_pct * target_r / 100)
+        rows.append({
+            "티커": ticker, "종목명": r["종목명"], "점수": r["기회점수"],
+            "진입가": float(r["종가"]), "손절가": round(stop_price, 0),
+            "목표가": round(target_price, 0), "수량": sz["수량"], "금액": sz["금액"],
+            "계좌대비(%)": sz["계좌대비"], "리스크(원)": sz["실제리스크"],
+            "왕복비용(원)": cost["합계"], "손익분기(%)": cost["손익분기(%)"],
+            "제약": sz["제약"], "거래대금(억)": float(r["거래대금"]),
+        })
+    return pd.DataFrame(rows).set_index("티커") if rows else pd.DataFrame()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 스크리너 백테스트 — 종목 선별 규칙이 실제로 통했는지
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
+                      min_cap: int, min_val: int, sc_days: int,
+                      fee_pct: float, tax_pct: float, auth_key: str) -> dict:
+    """
+    과거 리밸런스 시점마다 유니버스를 재구성해 상위 N 종목을 뽑고,
+    보유 기간 후 수익률을 코스피 대비로 측정합니다. 왕복 비용을 차감합니다.
+
+    리밸런스 1회당 KRX 호출 약 8회. 시간이 걸리므로 2시간 캐시합니다.
+    """
+    stock = get_stock_api()
+    end = _latest_bday()
+    span = (rebalances + 2) * hold_days + sc_days + 80
+    idx_start = (pd.Timestamp(end) - pd.Timedelta(days=int(span * 1.6))).strftime("%Y%m%d")
+
+    with capture_stdout("스크리너BT"):
+        kospi = _retry(
+            lambda: stock.get_index_ohlcv(idx_start, end, KOSPI_INDEX_TICKER, name_display=False),
+            "스크리너BT", tries=2)
+    if kospi is None or kospi.empty:
+        raise RuntimeError("백테스트용 코스피 지수를 가져오지 못했습니다")
+    cal = pd.to_datetime(kospi.index)
+    close = pd.to_numeric(kospi[_pick(kospi.columns, "종가")], errors="coerce")
+    close.index = cal
+
+    # 마지막 관측이 hold_days 뒤에 존재해야 하므로 뒤에서부터 배치
+    idxs = [len(cal) - 1 - hold_days - i * hold_days for i in range(rebalances)]
+    idxs = [i for i in idxs if i - sc_days - 60 > 0][::-1]
+    if not idxs:
+        raise RuntimeError("표본을 만들 만큼 과거 데이터가 없습니다. 리밸런스 수나 보유일을 줄이세요")
+
+    def call(fn, *a, **k):
+        with capture_stdout("스크리너BT"):
+            return _retry(lambda: fn(*a, **k), "스크리너BT", tries=2)
+
+    recs, per_period = [], []
+    log("스크리너BT", "백테스트 시작", 리밸런스=len(idxs), 보유일=hold_days, 전략=mode)
+
+    for n, i in enumerate(idxs):
+        d0 = cal[i]
+        d1 = cal[min(i + hold_days, len(cal) - 1)]
+        ds, de = d0.strftime("%Y%m%d"), d1.strftime("%Y%m%d")
+        s_start = cal[max(i - sc_days, 0)].strftime("%Y%m%d")
+        l_start = cal[max(i - 60, 0)].strftime("%Y%m%d")
+        try:
+            cap = call(stock.get_market_cap, ds, market="KOSPI")
+            fund = call(stock.get_market_fundamental, ds, market="KOSPI")
+            chg_s = call(stock.get_market_price_change, s_start, ds, "KOSPI")
+            chg_l = call(stock.get_market_price_change, l_start, ds, "KOSPI")
+            fwd = call(stock.get_market_price_change, ds, de, "KOSPI")
+
+            u = pd.DataFrame(index=cap.index)
+            nm = _pick(chg_s.columns, "종목명")
+            u["종목명"] = chg_s[nm] if nm is not None else u.index
+            u["종가"] = pd.to_numeric(cap[_pick(cap.columns, "종가")], errors="coerce")
+            u["시가총액"] = pd.to_numeric(cap[_pick(cap.columns, "시가총액")], errors="coerce") / 1e8
+            u["거래대금"] = pd.to_numeric(cap[_pick(cap.columns, "거래대금")], errors="coerce") / 1e8
+            for want in ("PER", "PBR", "DIV"):
+                c_ = _pick(fund.columns, want)
+                u[want] = pd.to_numeric(fund[c_], errors="coerce") if c_ is not None else float("nan")
+            u["단기등락률"] = pd.to_numeric(chg_s[_pick(chg_s.columns, "등락률")], errors="coerce")
+            u["장기등락률"] = pd.to_numeric(chg_l[_pick(chg_l.columns, "등락률")], errors="coerce")
+            for inv in ["기타법인", "외국인", "연기금", "기관합계"]:
+                try:
+                    npdf = call(stock.get_market_net_purchases_of_equities,
+                                s_start, ds, "KOSPI", inv)
+                    vc = _pick(npdf.columns, "순매수거래대금")
+                    u[f"순매수_{inv}"] = (pd.to_numeric(npdf[vc], errors="coerce")
+                                        .reindex(u.index).fillna(0) / 1e8)
+                except Exception:  # noqa: BLE001
+                    u[f"순매수_{inv}"] = 0.0
+
+            ranked = screen_stocks(u, mode, min_cap, min_val)
+            if ranked.empty:
+                continue
+            picks = ranked.head(top_n)
+            fret = pd.to_numeric(fwd[_pick(fwd.columns, "등락률")], errors="coerce")
+            r = fret.reindex(picks.index).dropna()
+            if r.empty:
+                continue
+
+            cost = fee_pct * 2 + tax_pct
+            net = r.mean() - cost
+            bench = (close.iloc[min(i + hold_days, len(close) - 1)] / close.iloc[i] - 1) * 100
+            per_period.append({
+                "진입일": f"{d0:%Y-%m-%d}", "청산일": f"{d1:%Y-%m-%d}", "종목수": len(r),
+                "평균(%)": round(r.mean(), 2), "비용차감(%)": round(net, 2),
+                "코스피(%)": round(bench, 2), "초과(%)": round(net - bench, 2),
+                "승률(%)": round((r > cost).mean() * 100, 1),
+            })
+            for t_, v_ in r.items():
+                recs.append({"기간": f"{d0:%Y-%m-%d}", "티커": t_, "수익률": v_})
+            log("스크리너BT", f"{n+1}/{len(idxs)} 완료", 진입일=f"{d0:%Y-%m-%d}",
+                평균=f"{r.mean():.2f}%", 코스피=f"{bench:.2f}%")
+        except Exception as e:  # noqa: BLE001
+            log_exc("스크리너BT", e, f"{ds} 구간 실패")
+            continue
+
+    if not per_period:
+        raise RuntimeError("유효한 구간이 없습니다")
+
+    pp = pd.DataFrame(per_period)
+    summary = {
+        "구간수": len(pp),
+        "평균 초과수익(%)": round(pp["초과(%)"].mean(), 2),
+        "중앙값 초과수익(%)": round(pp["초과(%)"].median(), 2),
+        "코스피 이긴 구간(%)": round((pp["초과(%)"] > 0).mean() * 100, 1),
+        "평균 수익(비용차감,%)": round(pp["비용차감(%)"].mean(), 2),
+        "코스피 평균(%)": round(pp["코스피(%)"].mean(), 2),
+        "최악 구간(%)": round(pp["비용차감(%)"].min(), 2),
+        "최고 구간(%)": round(pp["비용차감(%)"].max(), 2),
+        "구간 표준편차(%)": round(pp["비용차감(%)"].std(), 2),
+    }
+    log("스크리너BT", "백테스트 완료", **{k: v for k, v in list(summary.items())[:4]})
+    return {"per_period": pp, "summary": summary, "records": pd.DataFrame(recs),
+            "mode": mode, "hold": hold_days, "top_n": top_n}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 실전 매매 페르소나 (기본 5 + 실행 5)
+# ──────────────────────────────────────────────────────────────────────────────
+
+EXEC_PERSONAS = [
+    {"name": "국면 판정관", "icon": "🧭",
+     "system": "당신은 시장 국면만 판정하는 전략가입니다. 개별 종목이 아니라 '지금 위험을 "
+               "늘릴 때인가 줄일 때인가'만 답합니다. 애매하면 애매하다고 말합니다.",
+     "task": "현재 수급·추세 데이터로 국면을 판정하고, 신규 진입 배율을 몇으로 두어야 하는지 "
+             "근거와 함께 제시하십시오. 국면이 바뀌었다고 판단할 관측 조건도 쓰십시오."},
+    {"name": "포트폴리오 매니저", "icon": "🧮",
+     "system": "당신은 배분과 상관을 관리하는 포트폴리오 매니저입니다. 개별 종목의 매력보다 "
+               "포트폴리오 전체의 위험 집중을 봅니다. 같은 섹터 중복을 특히 경계합니다.",
+     "task": "제시된 종목들의 섹터·성격이 겹치는지 점검하고, 몇 종목까지 담아야 하는지, "
+             "종목당 상한을 얼마로 둘지 제시하십시오. 분산이 안 되는 조합이면 지적하십시오."},
+    {"name": "집행 트레이더", "icon": "⚡",
+     "system": "당신은 실제 주문을 넣는 집행 담당입니다. 좋은 아이디어도 체결이 나쁘면 "
+               "손실이라는 것을 압니다. 거래대금 대비 주문 크기와 분할 방식을 항상 따집니다.",
+     "task": "제시된 종목의 거래대금 대비 주문 규모가 적절한지 판단하고, 분할 매수 방식과 "
+             "체결 시 주의점을 구체적으로 쓰십시오. 유동성이 위험한 종목은 이름을 지목하십시오."},
+    {"name": "비용 분석가", "icon": "🧾",
+     "system": "당신은 수수료·세금·슬리피지를 계산하는 비용 분석가입니다. 매매 빈도가 "
+               "수익을 어떻게 갉아먹는지 숫자로 보여줍니다.",
+     "task": "제시된 손익분기 비용을 근거로, 이 전략의 기대 수익이 비용을 감당할 수준인지 "
+             "판단하십시오. 회전율을 낮춰야 한다면 얼마나 낮춰야 하는지 쓰십시오."},
+    {"name": "사전 부검관", "icon": "⚰️",
+     "system": "당신은 사전 부검(pre-mortem)을 담당합니다. 이 계획이 6개월 뒤 실패했다고 "
+               "'이미 확정된 사실'로 가정하고, 그 원인을 과거형으로 서술합니다. "
+               "가능성을 논하지 말고 실패했다고 전제하십시오.",
+     "task": "6개월 뒤 이 매매 계획이 실패했습니다. 무엇 때문이었는지 가장 그럴듯한 원인 "
+             "3가지를 과거형으로 서술하고, 각각을 지금 막을 수 있는 조치를 하나씩 쓰십시오."},
+]
+
+
+# 판단 5인 + 실행 5인
+ALL_PERSONAS = PERSONAS + EXEC_PERSONAS
+
+
+def exec_context(plan: pd.DataFrame, capital: float, gate: float, gate_label: str,
+                 risk_pct: float, stop_pct: float, fee_pct: float, tax_pct: float) -> str:
+    if plan is None or plan.empty:
+        return "\n[매매 계획] 아직 생성된 계획이 없습니다.\n"
+    total_val = plan["금액"].sum()
+    total_risk = plan["리스크(원)"].sum()
+    lines = "\n".join(
+        f"- {r['종목명']}({t}): {r['수량']:,}주 × {r['진입가']:,.0f}원 = {r['금액']/1e4:,.0f}만원 "
+        f"(계좌 {r['계좌대비(%)']:.1f}%), 손절 {r['손절가']:,.0f} / 목표 {r['목표가']:,.0f}, "
+        f"제약 {r['제약']}, 거래대금 {r['거래대금(억)']:,.0f}억"
+        for t, r in plan.iterrows())
+    return f"""
+[매매 계획]
+- 계좌 {capital/1e4:,.0f}만원 · 국면 배율 {gate:.2f} ({gate_label})
+- 종목당 리스크 {risk_pct}% · 손절폭 {stop_pct}% · 왕복비용 {fee_pct*2 + tax_pct:.3f}%
+- 총 투입 {total_val/1e4:,.0f}만원 (계좌의 {total_val/capital*100:.1f}%)
+- 총 리스크(전 종목 손절 시) {total_risk/1e4:,.0f}만원 (계좌의 {total_risk/capital*100:.2f}%)
+{lines}
+"""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 사이드바
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1482,8 +1748,9 @@ st.write("")
 # 탭
 # ──────────────────────────────────────────────────────────────────────────────
 
-(tab_chart, tab_flow, tab_corp, tab_screen, tab_persona, tab_bt, tab_diag) = st.tabs(
-    ["캔들 차트", "수급 상세", "기타법인 추적", "종목 스크리너", "페르소나 회의", "백테스트", "진단"])
+(tab_chart, tab_flow, tab_corp, tab_screen, tab_plan, tab_persona, tab_bt, tab_diag) = st.tabs(
+    ["캔들 차트", "수급 상세", "기타법인 추적", "종목 스크리너", "매매 계획",
+     "페르소나 회의", "검증", "진단"])
 
 with tab_chart:
     opt = st.columns([2.2, 1, 1])
@@ -1680,6 +1947,64 @@ with tab_bt:
     elif bt:
         st.info("집계할 표본이 부족합니다. 기간을 늘려 보세요.")
 
+    st.divider()
+    st.markdown("### 종목 스크리너 검증")
+    st.markdown(
+        "과거 리밸런스 시점마다 유니버스를 다시 만들어 상위 종목을 뽑고, 보유 기간 뒤 "
+        "수익률을 코스피와 비교합니다. 왕복 비용을 차감합니다. **초과수익이 0 근처면 "
+        "이 규칙은 코스피를 사는 것과 다르지 않습니다.**"
+    )
+    b = st.columns(4)
+    bt_reb = b[0].number_input("리밸런스 횟수", 4, 24, 10, step=1)
+    bt_hold = b[1].number_input("보유 기간(영업일)", 5, 60, 20, step=5)
+    bt_top = b[2].number_input("편입 종목 수", 3, 30, 10, step=1)
+    bt_mode = b[3].selectbox("전략", ["낙폭과대 반등", "추세 지속"], key="btmode")
+    st.caption(f"예상 KRX 호출 약 {int(bt_reb) * 8}회 · 1~3분 소요 · 결과는 2시간 캐시")
+
+    if st.button("스크리너 백테스트 실행"):
+        try:
+            with st.spinner("과거 시점 유니버스를 재구성하는 중… 시간이 걸립니다"):
+                sbt = screener_backtest(int(bt_reb), int(bt_hold), bt_mode, int(bt_top),
+                                        3000, 20, 20, 0.015, 0.15, krx_id)
+            st.session_state["sbt"] = sbt
+        except Exception as e:  # noqa: BLE001
+            log_exc("스크리너BT", e, "백테스트 실패")
+            st.error(f"백테스트 실패 — {type(e).__name__}: {e}")
+
+    sbt = st.session_state.get("sbt")
+    if sbt:
+        s_ = sbt["summary"]
+        m1 = st.columns(4)
+        exc = s_["평균 초과수익(%)"]
+        m1[0].markdown(kpi("평균 초과수익", f"{exc:+.2f}%p",
+                           f"코스피 대비 · {s_['구간수']}개 구간",
+                           C_UP if exc > 0 else C_DOWN), unsafe_allow_html=True)
+        m1[1].markdown(kpi("코스피 이긴 구간", f"{s_['코스피 이긴 구간(%)']:.0f}%",
+                           "50% 는 동전던지기", C_ACCENT), unsafe_allow_html=True)
+        m1[2].markdown(kpi("전략 평균(비용차감)", f"{s_['평균 수익(비용차감,%)']:+.2f}%",
+                           f"코스피 {s_['코스피 평균(%)']:+.2f}%",
+                           tone_for(s_["평균 수익(비용차감,%)"])), unsafe_allow_html=True)
+        m1[3].markdown(kpi("최악 구간", f"{s_['최악 구간(%)']:+.2f}%",
+                           f"표준편차 {s_['구간 표준편차(%)']:.2f}%p", C_DOWN),
+                       unsafe_allow_html=True)
+
+        st.dataframe(sbt["per_period"], use_container_width=True, hide_index=True,
+                     height=min(420, 60 + 36 * len(sbt["per_period"])))
+        cmp_df = sbt["per_period"].set_index("진입일")[["비용차감(%)", "코스피(%)"]]
+        st.markdown("**구간별 전략 vs 코스피**")
+        st.bar_chart(cmp_df, color=[C_UP, C_MUTED], height=260)
+
+        if abs(exc) < 0.5:
+            st.warning("초과수익이 0 근처입니다. 이 선별 규칙은 코스피를 그냥 사는 것과 "
+                       "구분되지 않습니다. 가중치를 바꾸거나 전략을 재검토하세요.", icon="⚠️")
+        elif exc < 0:
+            st.error("규칙이 코스피보다 못했습니다. 현재 형태로 실전에 쓰지 마십시오.", icon="🛑")
+        else:
+            st.info(f"구간 {s_['구간수']}개는 통계적으로 매우 적은 표본입니다. "
+                    "구간 수를 늘려도 결과가 유지되는지, 다른 기간에서도 재현되는지 "
+                    "확인하기 전에는 우연일 가능성이 큽니다.", icon="🔬")
+
+
 with tab_diag:
     s1, s2 = st.columns(2)
     s1.markdown("**KRX 인증**")
@@ -1822,10 +2147,18 @@ with tab_persona:
         "같은 데이터를 다섯 명의 서로 다른 관점에 각각 넘기고, 마지막에 조율합니다. "
         "합의를 만드는 것이 목적이 아니라 **어디서 의견이 갈리는지** 드러내는 것이 목적입니다."
     )
-    pc = st.columns(len(PERSONAS))
-    for i, p in enumerate(PERSONAS):
-        pc[i].markdown(kpi(f"{p['icon']} {p['name']}", "", p["task"][:34] + "…", C_MUTED),
-                       unsafe_allow_html=True)
+    chosen_names = st.multiselect(
+        "소집할 페르소나", [p["name"] for p in ALL_PERSONAS],
+        default=[p["name"] for p in ALL_PERSONAS],
+        help="앞 5명은 판단, 뒤 5명은 실행을 담당합니다. 호출 수 = 선택 인원 + 1")
+    chosen = [p for p in ALL_PERSONAS if p["name"] in chosen_names]
+    if chosen:
+        cols_n = min(5, len(chosen))
+        for start in range(0, len(chosen), cols_n):
+            pc = st.columns(cols_n)
+            for j, p in enumerate(chosen[start:start + cols_n]):
+                pc[j].markdown(kpi(f"{p['icon']} {p['name']}", "",
+                                   p["task"][:34] + "…", C_MUTED), unsafe_allow_html=True)
     st.write("")
 
     if not groq_api_key:
@@ -1841,13 +2174,17 @@ with tab_persona:
 
         if run_all:
             model, available = resolve_groq_model(groq_api_key, model_choice)
-            st.caption(f"모델 `{model}` · 호출 {len(PERSONAS) + 1}회")
+            st.caption(f"모델 `{model}` · 호출 {len(chosen) + 1}회")
             ctx = persona_context(
                 df, sig, guide, cash_ratio,
                 picks_df if include else None,
                 st.session_state.get("screen", {}).get("mode", "-"))
+            pl = st.session_state.get("plan")
+            if pl is not None and not pl["plan"].empty:
+                ctx += exec_context(pl["plan"], pl["capital"], pl["gate"], pl["gate_label"],
+                                    pl["risk_pct"], pl["stop_pct"], pl["fee_pct"], pl["tax_pct"])
             opinions: dict[str, str] = {}
-            for p in PERSONAS:
+            for p in chosen:
                 st.markdown(f"#### {p['icon']} {p['name']}")
                 try:
                     opinions[p["name"]] = st.write_stream(
@@ -1870,11 +2207,131 @@ with tab_persona:
             cl = st.session_state["council"]
             st.caption(f"모델 `{cl['model']}` · 생성 {cl['at']:%Y-%m-%d %H:%M} KST")
             for name, text in cl["opinions"].items():
-                icon = next((p["icon"] for p in PERSONAS if p["name"] == name), "•")
+                icon = next((p["icon"] for p in ALL_PERSONAS if p["name"] == name), "•")
                 with st.expander(f"{icon} {name}"):
                     st.markdown(text)
             st.markdown("#### ⚖️ 종합 판정")
             st.markdown(cl["final"])
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 매매 계획 탭 — 신호를 주문으로 바꾸는 곳
+# ──────────────────────────────────────────────────────────────────────────────
+
+with tab_plan:
+    st.markdown("### 매매 계획")
+    st.markdown(
+        "신호가 아니라 **여기가 계좌를 지키는 자리**입니다. 진입가·손절가·수량·리스크를 "
+        "주문 넣기 전에 확정하고, 세 가지 한도 중 가장 낮은 값으로 크기를 정합니다."
+    )
+
+    gate, gate_label = market_gate(sig["score"])
+    g = st.columns(3)
+    g[0].markdown(kpi("시장 국면 게이트", f"×{gate:.2f}",
+                      f"수급 스코어 {sig['score']} → {gate_label}",
+                      C_UP if gate >= 0.75 else C_ACCENT if gate > 0 else C_DOWN),
+                  unsafe_allow_html=True)
+    stale = (now_kst().date() - df.index[-1].date()).days
+    g[1].markdown(kpi("데이터 신선도", f"{stale}일 전",
+                      f"최근 영업일 {df.index[-1]:%Y-%m-%d}",
+                      C_UP if stale <= 3 else C_DOWN), unsafe_allow_html=True)
+    g[2].markdown(kpi("KRX 인증", "정상" if AUTH_STATE.get("성공") else "실패",
+                      AUTH_STATE.get("메시지", ""),
+                      C_UP if AUTH_STATE.get("성공") else C_DOWN), unsafe_allow_html=True)
+
+    if gate == 0:
+        st.error("현재 국면에서는 신규 진입을 권하지 않습니다. 수량이 0으로 계산됩니다.", icon="🛑")
+    if stale > 4:
+        st.warning(f"데이터가 {stale}일 지났습니다. 최신 시세로 진입가를 다시 확인하세요.", icon="⏱")
+
+    st.divider()
+    p1 = st.columns(4)
+    capital = p1[0].number_input("계좌 자본(만원)", 100, 1000000, 5000, step=100) * 1e4
+    risk_pct = p1[1].number_input("종목당 리스크(%)", 0.1, 5.0, 1.0, step=0.1,
+                                  help="손절까지 갔을 때 계좌에서 잃을 비율")
+    stop_pct = p1[2].number_input("손절폭(%)", 3.0, 30.0, 10.0, step=0.5)
+    target_r = p1[3].number_input("목표 배수(R)", 1.0, 5.0, 2.0, step=0.5,
+                                  help="손절폭의 몇 배를 목표로 할지")
+
+    p2 = st.columns(4)
+    max_weight = p2[0].number_input("종목당 비중 상한(%)", 1.0, 50.0, 10.0, step=1.0)
+    adv_cap = p2[1].number_input("거래대금 대비 상한(%)", 0.1, 20.0, 2.0, step=0.1,
+                                 help="주문금액이 일평균 거래대금의 몇 %를 넘지 않을지")
+    fee_pct = p2[2].number_input("수수료(편도 %)", 0.0, 1.0, 0.015, step=0.005, format="%.3f")
+    tax_pct = p2[3].number_input("매도 거래세(%)", 0.0, 1.0, 0.15, step=0.01, format="%.3f",
+                                 help="세율은 수시로 바뀝니다. 본인 증권사 기준으로 확인하세요.")
+
+    picks_df = st.session_state.get("picks")
+    if picks_df is None or picks_df.empty:
+        st.info("종목 스크리너를 먼저 실행하면 계획이 생성됩니다.", icon="📋")
+    else:
+        plan = build_trade_plan(picks_df, capital, risk_pct, stop_pct, max_weight,
+                                adv_cap, fee_pct, tax_pct, gate, target_r)
+        if plan.empty:
+            st.warning("현재 조건에서 수량이 1주 이상 나오는 종목이 없습니다. "
+                       "자본을 늘리거나 손절폭·한도를 조정하세요.")
+        else:
+            st.session_state["plan"] = {
+                "plan": plan, "capital": capital, "gate": gate, "gate_label": gate_label,
+                "risk_pct": risk_pct, "stop_pct": stop_pct,
+                "fee_pct": fee_pct, "tax_pct": tax_pct}
+
+            inv_total = plan["금액"].sum()
+            risk_total = plan["리스크(원)"].sum()
+            cost_total = plan["왕복비용(원)"].sum()
+            k = st.columns(4)
+            k[0].markdown(kpi("총 투입", f"{inv_total/1e4:,.0f}만원",
+                              f"계좌의 {inv_total/capital*100:.1f}%", C_ACCENT),
+                          unsafe_allow_html=True)
+            k[1].markdown(kpi("총 리스크", f"{risk_total/1e4:,.0f}만원",
+                              f"전 종목 손절 시 계좌의 {risk_total/capital*100:.2f}%",
+                              C_DOWN if risk_total/capital*100 > 6 else C_UP),
+                          unsafe_allow_html=True)
+            k[2].markdown(kpi("왕복 비용", f"{cost_total/1e4:,.0f}만원",
+                              f"투입액의 {cost_total/inv_total*100:.3f}%", C_MUTED),
+                          unsafe_allow_html=True)
+            k[3].markdown(kpi("편입 종목", f"{len(plan)}개",
+                              f"평균 {plan['계좌대비(%)'].mean():.1f}% / 종목", C_MUTED),
+                          unsafe_allow_html=True)
+
+            if risk_total / capital * 100 > 6:
+                st.error(
+                    f"총 리스크가 계좌의 {risk_total/capital*100:.1f}% 입니다. "
+                    "전 종목이 동시에 손절되는 상황은 하락장에서 실제로 일어납니다. "
+                    "6% 이내를 권합니다 — 종목당 리스크를 낮추거나 종목 수를 줄이세요.", icon="🔥")
+
+            view = plan.drop(columns=["점수"]).copy()
+            st.dataframe(
+                view.style.format({
+                    "진입가": "{:,.0f}", "손절가": "{:,.0f}", "목표가": "{:,.0f}",
+                    "수량": "{:,.0f}", "금액": "{:,.0f}", "계좌대비(%)": "{:.2f}",
+                    "리스크(원)": "{:,.0f}", "왕복비용(원)": "{:,.0f}",
+                    "손익분기(%)": "{:.3f}", "거래대금(억)": "{:,.0f}"}, na_rep="—"),
+                use_container_width=True, height=min(460, 60 + 36 * len(view)))
+
+            binding = plan["제약"].value_counts()
+            st.caption("크기를 결정한 제약: " +
+                       " · ".join(f"{k_} {v_}종목" for k_, v_ in binding.items()))
+
+            st.download_button("매매 계획 CSV 내려받기",
+                               data=plan.to_csv().encode("utf-8-sig"),
+                               file_name=f"plan_{now_kst():%Y%m%d_%H%M}.csv", mime="text/csv")
+
+            st.markdown("#### 주문 전 체크리스트")
+            checks = [
+                "각 종목의 최근 공시를 DART 에서 확인했다 (특히 자기주식취득·유상증자)",
+                "직전 분기 실적과 적자 여부를 확인했다",
+                "손절가를 주문 시스템에 실제로 입력했다 (머릿속 손절은 지켜지지 않는다)",
+                f"총 리스크 {risk_total/capital*100:.2f}% 를 감당할 수 있다",
+                "같은 섹터에 과도하게 몰려 있지 않다",
+                "이 계획이 틀렸을 때 무엇을 보고 알 것인지 정했다",
+            ]
+            done = [st.checkbox(c, key=f"chk_{i}") for i, c in enumerate(checks)]
+            if all(done):
+                st.success("체크리스트 완료. 계획대로 집행하세요.", icon="✅")
+            else:
+                st.caption(f"{sum(done)}/{len(checks)} 완료 — 전부 확인하기 전에는 주문하지 마세요.")
 
 
 st.divider()
