@@ -534,6 +534,232 @@ def load_net_purchases(days: int, investor: str, auth_key: str) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 종목 스크리너
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# 시장 전체를 훑어 '수급은 유입됐는데 가격은 아직 반응하지 않은' 종목을 걸러냅니다.
+# 호출 수는 종목 수와 무관하게 7회 내외입니다 (전종목 일괄 조회 API 사용).
+#
+# 이것은 후보 필터이며 매수 추천이 아닙니다. 수급은 후행 지표이고,
+# 실적·공시·유상증자·소송처럼 가격을 좌우하는 정보는 이 데이터에 없습니다.
+
+SCREEN_INVESTORS = ["외국인", "기관합계", "기타법인", "연기금"]
+EXCLUDE_KEYWORDS = ("스팩", "우B", "우C")
+
+SCREEN_RULES = [
+    ("외국인 순매수 > 0", 25, "외국인 자금 유입"),
+    ("기관 순매수 > 0", 20, "기관 동반 여부"),
+    ("수급강도 상위 20%", 25, "시총 대비 유입 규모 — 대형·소형주를 공평하게 비교"),
+    ("가격 미반응 (수익률 하위 50%)", 15, "수급은 왔는데 아직 안 오름 = 매집 국면 가정"),
+    ("기타법인 순매수 > 0", 15, "자사주 매입 등 하방 지지"),
+]
+
+
+def _biz_day(offset_days: int = 0) -> str:
+    stock = get_stock_api()
+    base = (now_kst() - timedelta(days=offset_days)).strftime("%Y%m%d")
+    try:
+        with capture_stdout("스크리너"):
+            return stock.get_nearest_business_day_in_a_week(base)
+    except Exception:  # noqa: BLE001
+        return base
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_screen_data(days: int, auth_key: str) -> tuple[pd.DataFrame, dict]:
+    stock = get_stock_api()
+    end = _biz_day(0)
+    start = _biz_day(int(days * 1.5) + 5)
+    meta = {"시작일": start, "종료일": end}
+    log("스크리너", "시장 전체 수집 시작", 기간=f"{start}~{end}")
+
+    flows: dict[str, pd.Series] = {}
+    for inv in SCREEN_INVESTORS:
+        try:
+            with capture_stdout("스크리너"):
+                d = _retry(
+                    lambda: stock.get_market_net_purchases_of_equities(start, end, "KOSPI", inv),
+                    "스크리너", tries=2)
+            col = _pick(d.columns, "순매수거래대금")
+            if col is None:
+                continue
+            flows[inv] = pd.to_numeric(d[col], errors="coerce") / 1e8
+            nm = _pick(d.columns, "종목명")
+            if nm is not None and "종목명" not in meta:
+                meta["_names"] = d[nm]
+            log("스크리너", f"{inv} 종목별 순매수", 종목수=len(d))
+        except Exception as e:  # noqa: BLE001
+            log_exc("스크리너", e, f"{inv} 순매수 조회 실패")
+
+    if "외국인" not in flows:
+        raise RuntimeError("외국인 종목별 순매수 데이터를 가져오지 못했습니다")
+
+    with capture_stdout("스크리너"):
+        cap = _retry(lambda: stock.get_market_cap_by_ticker(end, "KOSPI", alternative=True),
+                     "스크리너", tries=2)
+        px_e = _retry(lambda: stock.get_market_ohlcv_by_ticker(end, "KOSPI", alternative=True),
+                      "스크리너", tries=2)
+        px_s = _retry(lambda: stock.get_market_ohlcv_by_ticker(start, "KOSPI", alternative=True),
+                      "스크리너", tries=2)
+    log("스크리너", "시총·가격 수신", 종목수=len(cap))
+
+    fund = None
+    try:
+        with capture_stdout("스크리너"):
+            fund = _retry(
+                lambda: stock.get_market_fundamental_by_ticker(end, "KOSPI", alternative=True),
+                "스크리너", tries=2)
+    except Exception as e:  # noqa: BLE001
+        log("스크리너", f"밸류에이션 생략 — {type(e).__name__}", level="WARN")
+
+    out = pd.DataFrame(index=cap.index)
+    out["시가총액"] = pd.to_numeric(cap[_pick(cap.columns, "시가총액")], errors="coerce") / 1e8
+    dv = _pick(cap.columns, "거래대금")
+    out["거래대금"] = (pd.to_numeric(cap[dv], errors="coerce") / 1e8) if dv else float("nan")
+    for inv, sr in flows.items():
+        out[f"{inv}순매수"] = sr.reindex(out.index)
+
+    out["종가"] = pd.to_numeric(px_e[_pick(px_e.columns, "종가")], errors="coerce").reindex(out.index)
+    p0 = pd.to_numeric(px_s[_pick(px_s.columns, "종가")], errors="coerce").reindex(out.index)
+    out["기간수익률"] = ((out["종가"] / p0 - 1) * 100).round(2)
+
+    if fund is not None:
+        for k in ("PER", "PBR", "DIV"):
+            col = _pick(fund.columns, k)
+            if col is not None:
+                out[k] = pd.to_numeric(fund[col], errors="coerce").reindex(out.index)
+
+    names = meta.pop("_names", None)
+    nm_col = _pick(px_e.columns, "종목명") or _pick(cap.columns, "종목명")
+    if nm_col:
+        src = px_e if nm_col in px_e.columns else cap
+        out["종목명"] = src[nm_col].reindex(out.index)
+    elif names is not None:
+        out["종목명"] = names.reindex(out.index)
+    else:
+        out["종목명"] = out.index
+
+    out["종목명"] = out["종목명"].fillna(pd.Series(out.index, index=out.index))
+    out = out.dropna(subset=["시가총액", "종가"])
+    meta["종목수"] = len(out)
+    meta["투자자"] = list(flows)
+    log("스크리너", "결합 완료", 종목수=len(out))
+    return out, meta
+
+
+def screen(raw: pd.DataFrame, min_cap: float = 3000, min_value: float = 10,
+           require_foreign: bool = True, exclude_pref: bool = True) -> pd.DataFrame:
+    df = raw.copy()
+    n0 = len(df)
+    df = df[df["시가총액"] >= min_cap]
+    if "거래대금" in df.columns:
+        df = df[df["거래대금"].fillna(0) >= min_value]
+    if exclude_pref:
+        nm = df["종목명"].astype(str)
+        df = df[~nm.str.endswith("우")]
+        for kw in EXCLUDE_KEYWORDS:
+            df = df[~nm.str.contains(kw, na=False)]
+    log("스크리너", "유동성 필터", 전=n0, 후=len(df))
+    if df.empty:
+        return df
+
+    f = df["외국인순매수"].fillna(0)
+    i = df.get("기관합계순매수", pd.Series(0.0, index=df.index)).fillna(0)
+    c = df.get("기타법인순매수", pd.Series(0.0, index=df.index)).fillna(0)
+
+    df["수급강도"] = ((f + i) / df["시가총액"] * 100).round(3)
+    str_thr = float(df["수급강도"].quantile(0.80))
+    ret_thr = float(df["기간수익률"].median())
+
+    conds = pd.DataFrame(index=df.index)
+    conds["c1"] = f > 0
+    conds["c2"] = i > 0
+    conds["c3"] = df["수급강도"] >= str_thr
+    conds["c4"] = df["기간수익률"] <= ret_thr
+    conds["c5"] = c > 0
+
+    df["후보점수"] = sum(conds[f"c{k+1}"].astype(int) * w
+                     for k, (_, w, _) in enumerate(SCREEN_RULES))
+    df["충족조건"] = conds.apply(
+        lambda r: ", ".join(SCREEN_RULES[k][0] for k in range(5) if r[f"c{k+1}"]), axis=1)
+
+    def phase(r):
+        if r["수급강도"] > 0 and r["기간수익률"] <= 0:
+            return "매집 후보"
+        if r["수급강도"] > 0:
+            return "동행 상승"
+        if r["기간수익률"] > 0:
+            return "수급 없는 상승"
+        return "수급·가격 동반 약세"
+
+    df["국면"] = df.apply(phase, axis=1)
+    if require_foreign:
+        df = df[conds["c1"]]
+    df.attrs["강도상위20%"] = round(str_thr, 3)
+    df.attrs["수익률중앙"] = round(ret_thr, 2)
+    return df.sort_values(["후보점수", "수급강도"], ascending=False)
+
+
+EVIDENCE_COLS = ["종목명", "후보점수", "국면", "수급강도", "외국인순매수", "기관합계순매수",
+                 "기타법인순매수", "연기금순매수", "기간수익률", "시가총액", "거래대금",
+                 "PER", "PBR", "DIV", "충족조건"]
+
+PERSPECTIVES = {
+    "수급 분석가": ("당신은 수급 데이터만으로 판단하는 애널리스트입니다. 제시된 종목에서 "
+               "매수 논거가 성립하는 근거를 데이터에서 찾아 제시하십시오. "
+               "근거가 약한 종목은 약하다고 명시하십시오."),
+    "회의론자": ("당신은 위 매수 논거를 무너뜨리는 역할입니다. 수급 데이터만으로 판단할 때 "
+             "생기는 함정, 반대 해석 가능성, 데이터에 없는 위험 요인을 지적하십시오. "
+             "'조심하세요' 같은 일반론은 금지하고 이 종목·이 수치에 붙는 반박만 쓰십시오."),
+    "리스크 매니저": ("당신은 손실 관리 담당입니다. 각 종목에 대해 (1) 논거가 틀렸다고 판정할 "
+                "관측 조건, (2) 최대 손실 시나리오, (3) 포지션 크기를 제한해야 하는 근거를 "
+                "제시하십시오. 수익 전망은 절대 언급하지 마십시오."),
+}
+
+
+def build_review_prompt(cand: pd.DataFrame, sig: dict, score: int, days: int,
+                        role: str, prior: str = "") -> str:
+    keep = [c for c in ["종목명", "후보점수", "국면", "수급강도", "외국인순매수",
+                        "기관합계순매수", "기타법인순매수", "기간수익률", "시가총액",
+                        "PER", "PBR"] if c in cand.columns]
+    prior_block = f"\n[앞선 관점의 주장 — 반박 또는 보완 대상]\n{prior}\n" if prior else ""
+    return f"""[역할]
+{PERSPECTIVES[role]}
+
+[시장 전체 국면]
+- 코스피 수급 스코어 {score}/100 · 다이버전스 판정 {sig['divergence'][0]}
+- {sig['short']}일 누적: 외국인 {sig['rolling']['외국인']:,.0f}억 / 기관 {sig['rolling']['기관']:,.0f}억 / 기타법인 {sig['rolling']['기타법인']:,.0f}억
+
+[스크리너 통과 종목 — 최근 {days}일 집계, 순매수 단위 억원]
+{cand[keep].to_string()}
+
+[컬럼 정의]
+- 수급강도 = (외국인+기관 순매수) / 시가총액 × 100. 시총 대비 비율이라 종목 규모가 중립화된 값
+- 국면 '매집 후보' = 수급은 유입인데 기간 수익률이 0 이하
+- 후보점수 = 5개 조건의 가중합. 예측력이 검증되지 않은 규칙값
+{prior_block}
+[작성 규칙]
+- 위 표의 수치만 인용. 실적·수주·뉴스·목표주가를 지어내지 마십시오.
+- 종목별 2~3문장, 전체 6문단 이내.
+- 이 데이터로 판단 불가한 항목은 "이 데이터로는 알 수 없음"이라고 명시.
+- 목표주가·기대수익률 제시 금지.
+- 한국어로 작성."""
+
+
+def run_perspective(api_key: str, model: str, prompt: str, max_tokens: int = 1200) -> str:
+    from groq import Groq
+    r = Groq(api_key=api_key).chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content":
+                   "당신은 한국 주식시장 수급 데이터를 다루는 분석가입니다. 주어진 수치만 "
+                   "근거로 삼고, 모르는 것은 모른다고 말하며, 확신의 정도를 구분해 표현합니다."},
+                  {"role": "user", "content": prompt}],
+        temperature=0.2, max_tokens=max_tokens,
+    )
+    return (r.choices[0].message.content or "").strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 시그널 엔진 v2
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -872,6 +1098,253 @@ def stream_report(api_key: str, model: str, prompt: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 종목 스크리너
+# ──────────────────────────────────────────────────────────────────────────────
+
+SCREEN_INVESTORS = ["기타법인", "외국인", "연기금", "기관합계"]
+
+
+def _latest_bday() -> str:
+    stock = get_stock_api()
+    try:
+        with capture_stdout("스크리너"):
+            return stock.get_nearest_business_day_in_a_week()
+    except Exception:  # noqa: BLE001
+        return now_kst().strftime("%Y%m%d")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_universe(short_days: int, long_days: int, auth_key: str) -> pd.DataFrame:
+    """
+    시장 전체 스냅샷을 8회 호출로 구성합니다.
+    종목별 반복 조회 대신 전종목 API 를 쓰기 때문에 KRX 부하와 소요 시간이 작습니다.
+    """
+    stock = get_stock_api()
+    end = _latest_bday()
+    s_start = (pd.Timestamp(end) - pd.Timedelta(days=int(short_days * 1.6) + 6)).strftime("%Y%m%d")
+    l_start = (pd.Timestamp(end) - pd.Timedelta(days=int(long_days * 1.6) + 10)).strftime("%Y%m%d")
+    log("스크리너", "유니버스 수집 시작", 기준일=end, 단기=s_start, 장기=l_start)
+
+    def call(fn, *a, **k):
+        with capture_stdout("스크리너"):
+            return _retry(lambda: fn(*a, **k), "스크리너", tries=2)
+
+    cap = call(stock.get_market_cap, end, market="KOSPI")
+    fund = call(stock.get_market_fundamental, end, market="KOSPI")
+    chg_s = call(stock.get_market_price_change, s_start, end, "KOSPI")
+    chg_l = call(stock.get_market_price_change, l_start, end, "KOSPI")
+    log("스크리너", "시세·재무 수집 완료", 종목수=len(cap))
+
+    uni = pd.DataFrame(index=cap.index)
+    name_col = _pick(chg_s.columns, "종목명")
+    uni["종목명"] = chg_s[name_col] if name_col is not None else uni.index
+    uni["종가"] = pd.to_numeric(cap[_pick(cap.columns, "종가")], errors="coerce")
+    uni["시가총액"] = pd.to_numeric(cap[_pick(cap.columns, "시가총액")], errors="coerce")
+    uni["거래대금"] = pd.to_numeric(cap[_pick(cap.columns, "거래대금")], errors="coerce")
+    for src, want in [(fund, "PER"), (fund, "PBR"), (fund, "DIV")]:
+        col = _pick(src.columns, want)
+        uni[want] = pd.to_numeric(src[col], errors="coerce") if col is not None else float("nan")
+    uni["단기등락률"] = pd.to_numeric(chg_s[_pick(chg_s.columns, "등락률")], errors="coerce")
+    uni["장기등락률"] = pd.to_numeric(chg_l[_pick(chg_l.columns, "등락률")], errors="coerce")
+
+    for inv in SCREEN_INVESTORS:
+        try:
+            npdf = call(stock.get_market_net_purchases_of_equities, s_start, end, "KOSPI", inv)
+            vcol = _pick(npdf.columns, "순매수거래대금")
+            uni[f"순매수_{inv}"] = (
+                pd.to_numeric(npdf[vcol], errors="coerce").reindex(uni.index).fillna(0) / 1e8
+            )
+            log("스크리너", f"{inv} 순매수 수집", 종목수=int((uni[f'순매수_{inv}'] != 0).sum()))
+        except Exception as e:  # noqa: BLE001
+            log_exc("스크리너", e, f"{inv} 순매수 수집 실패")
+            uni[f"순매수_{inv}"] = 0.0
+
+    uni["시가총액"] = uni["시가총액"] / 1e8      # 억원
+    uni["거래대금"] = uni["거래대금"] / 1e8      # 억원
+    uni["기준일"] = end
+    log("스크리너", "유니버스 완성", 종목수=len(uni))
+    return uni
+
+
+def screen_stocks(uni: pd.DataFrame, mode: str, min_cap: int, min_value: int,
+                  exclude_pref: bool = True) -> pd.DataFrame:
+    """
+    순매수는 절대 금액이 아니라 시가총액 대비 비율로 평가합니다.
+    금액만 보면 대형주만 상위에 남아 정보가 없습니다.
+    """
+    d = uni.copy()
+    if exclude_pref:
+        d = d[[str(t).endswith("0") for t in d.index]]          # 우선주 제외
+    d = d[(d["시가총액"] >= min_cap) & (d["거래대금"] >= min_value)]
+    d = d.dropna(subset=["종가", "시가총액"])
+    if d.empty:
+        return d
+
+    for inv in SCREEN_INVESTORS:
+        d[f"강도_{inv}"] = d[f"순매수_{inv}"] / d["시가총액"] * 100   # 시총 대비 %
+
+    d["수급강도"] = d["강도_기타법인"] + d["강도_외국인"] + d["강도_연기금"]
+    d["매수주체수"] = sum((d[f"순매수_{i}"] > 0).astype(int)
+                       for i in ["기타법인", "외국인", "연기금", "기관합계"])
+
+    pct = lambda s: s.rank(pct=True) * 100  # noqa: E731
+
+    score = pct(d["수급강도"]) * 0.35
+    score += (d["매수주체수"] / 4 * 100) * 0.15
+    pbr_rank = (1 - d["PBR"].rank(pct=True)) * 100
+    score += pbr_rank.fillna(50) * 0.15
+
+    if mode == "낙폭과대 반등":
+        score += (1 - d["장기등락률"].rank(pct=True)) * 100 * 0.20   # 많이 빠진 종목
+        score += pct(d["단기등락률"] - d["장기등락률"]) * 0.15        # 최근 개선
+    else:  # 추세 지속
+        score += pct(d["장기등락률"]) * 0.20
+        score += pct(d["단기등락률"]) * 0.15
+
+    d["기회점수"] = score.round(1)
+    return d.sort_values("기회점수", ascending=False)
+
+
+def build_scenario(row: pd.Series, mode: str, short_days: int, long_days: int) -> dict:
+    """규칙에서 직접 유도되는 포착 근거와 시나리오. LLM 이 아니라 산술 결과입니다."""
+    reasons, checks = [], []
+
+    for inv, label in [("기타법인", "기타법인"), ("외국인", "외국인"), ("연기금", "연기금")]:
+        v, s = row[f"순매수_{inv}"], row[f"강도_{inv}"]
+        if v > 0:
+            reasons.append(f"{label} 순매수 {v:,.0f}억 (시총 대비 {s:.2f}%)")
+
+    if row["매수주체수"] >= 2:
+        reasons.append(f"매수 주체 {int(row['매수주체수'])}곳 동시 유입")
+    if pd.notna(row["PBR"]) and row["PBR"] < 1.0:
+        reasons.append(f"PBR {row['PBR']:.2f} — 청산가치 이하")
+    if mode == "낙폭과대 반등":
+        reasons.append(f"{long_days}일 {row['장기등락률']:+.1f}% / {short_days}일 {row['단기등락률']:+.1f}%")
+    else:
+        reasons.append(f"{long_days}일 {row['장기등락률']:+.1f}% 추세 유지")
+
+    price = row["종가"]
+    if mode == "낙폭과대 반등":
+        bull = (f"기관·외국인 매도가 잦아든 상태에서 {'기타법인' if row['순매수_기타법인'] > 0 else '외국인'} "
+                f"매수가 이어지면 낙폭 되돌림. 1차 목표는 {long_days}일 하락분의 3분의 1 회복 지점.")
+        entry = f"현재가 {price:,.0f}원 부근 분할 진입, 추가 하락 시 -7% 지점에서 2차."
+        invalid = (f"매수 주체가 순매도로 돌아서거나 종가가 최근 저점을 이탈하면 무효. "
+                   f"손절 기준 -10% 또는 직전 저점 하회.")
+    else:
+        bull = "수급과 가격이 같은 방향이라 추세 지속 가능성. 눌림목에서 비중 확대."
+        entry = f"현재가 {price:,.0f}원. 20일선 눌림 시 진입, 추격 매수 자제."
+        invalid = "외국인 순매수가 3일 연속 순매도로 전환되거나 20일선 이탈 시 무효."
+
+    if row["순매수_기타법인"] > 0:
+        checks.append("DART 에서 자기주식취득 공시 확인 — 없으면 계열사 지분 매입일 수 있음")
+    if pd.isna(row["PER"]) or row["PER"] <= 0:
+        checks.append("PER 산출 불가 — 적자 기업 여부 확인 필요")
+    checks.append("최근 공시·실적·유상증자 여부 확인")
+    checks.append(f"거래대금 {row['거래대금']:,.0f}억 — 체결 슬리피지 감안")
+
+    return {"reasons": reasons, "bull": bull, "entry": entry,
+            "invalid": invalid, "checks": checks}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 페르소나 회의
+# ──────────────────────────────────────────────────────────────────────────────
+
+PERSONAS = [
+    {"name": "수급 분석가", "icon": "📊",
+     "system": "당신은 기관·외국인 자금 흐름만으로 시장을 읽는 수급 분석가입니다. "
+               "가격이 아니라 '누가 사고 누가 파는가'와 그 자금의 성격(장기/단기)을 봅니다. "
+               "제공된 수치만 근거로 삼고, 자금 성격을 구분해 서술하십시오.",
+     "task": "수급 구조를 진단하고, 제시된 종목들의 매수 주체가 어떤 성격인지 구분하십시오. "
+             "특히 기타법인 자금이 자사주 매입일 가능성과 그 한계를 짚으십시오."},
+    {"name": "가치 투자자", "icon": "🏛",
+     "system": "당신은 밸류에이션과 재무 안정성을 우선하는 가치 투자자입니다. "
+               "저PBR 이 곧 저평가가 아니라는 것을 알고 있으며, 싼 데는 이유가 있다고 의심합니다.",
+     "task": "제시된 종목의 PBR·PER 이 진짜 저평가인지 밸류 트랩인지 판단 기준을 제시하십시오. "
+             "재무 데이터가 부족하다면 무엇을 더 봐야 하는지 명시하십시오."},
+    {"name": "모멘텀 트레이더", "icon": "📈",
+     "system": "당신은 가격 추세와 거래량으로만 판단하는 단기 트레이더입니다. "
+               "떨어지는 칼날을 잡지 않으며, 진입 시점과 손절 위치를 항상 구체적으로 말합니다.",
+     "task": "낙폭과대 종목의 진입 타이밍 판단 기준을 제시하십시오. "
+             "지금 사야 할 이유가 없다면 없다고 말하고, 무엇을 기다려야 하는지 쓰십시오."},
+    {"name": "리스크 매니저", "icon": "🛡",
+     "system": "당신은 손실 관리를 책임지는 리스크 매니저입니다. 수익 가능성보다 "
+               "무엇이 이 거래를 죽이는지에 집중합니다. 포지션 크기와 손절을 반드시 언급합니다.",
+     "task": "이 아이디어가 실패하는 경로를 구체적으로 나열하고, 현금 비중과 종목당 배분 한도를 "
+             "제시하십시오. 유동성·집중도 위험을 반드시 다루십시오."},
+    {"name": "레드팀", "icon": "🔍",
+     "system": "당신은 스크리너 자체를 의심하는 검증자입니다. 규칙 기반 선별이 만들어내는 "
+               "편향과 착시를 찾아냅니다. 동의하는 것이 당신의 역할이 아닙니다.",
+     "task": "이 스크리닝 방식의 구조적 결함을 지적하십시오. 선택 편향, 데이터 한계, "
+             "규칙이 놓치는 정보가 무엇인지 구체적으로 쓰십시오. 최소 3가지."},
+]
+
+
+def persona_context(df: pd.DataFrame, sig: dict, guide: dict, cash_ratio: int,
+                    picks: Optional[pd.DataFrame], mode: str) -> str:
+    div_name, div_desc, _ = sig["divergence"]
+    ctx = f"""[시장 전체 수급 — 코스피]
+- 최근 영업일: {df.index[-1]:%Y-%m-%d}, 종가 {df['종가'].iloc[-1]:,.2f}
+- {sig['short']}일 누적 순매수(억): 외국인 {sig['rolling']['외국인']:,.0f} / 기관 {sig['rolling']['기관']:,.0f} / 기타법인 {sig['rolling']['기타법인']:,.0f} / 개인 {sig['rolling']['개인']:,.0f}
+- 외국인 z-score {sig['zscore']:+.2f}, 연속 순매수 {sig['streak_foreign']}일
+- 다이버전스 판정: {div_name} ({div_desc})
+- 규칙 스코어 {sig['score']}/100 ({guide['band']}) · 현금 비중 {cash_ratio}%
+"""
+    if picks is not None and not picks.empty:
+        rows = []
+        for t, r in picks.iterrows():
+            rows.append(
+                f"- {r['종목명']}({t}): 기회점수 {r['기회점수']:.0f}, 시총 {r['시가총액']:,.0f}억, "
+                f"PBR {r['PBR'] if pd.notna(r['PBR']) else float('nan'):.2f}, "
+                f"기간등락 {r['단기등락률']:+.1f}%/{r['장기등락률']:+.1f}%, "
+                f"순매수(억) 기타법인 {r['순매수_기타법인']:,.0f} 외국인 {r['순매수_외국인']:,.0f} "
+                f"연기금 {r['순매수_연기금']:,.0f}, 거래대금 {r['거래대금']:,.0f}억")
+        ctx += f"\n[스크리너 선별 종목 — 전략: {mode}]\n" + "\n".join(rows) + "\n"
+    ctx += ("\n[제약] 위 수치 외의 뉴스·실적·목표주가를 지어내지 마십시오. "
+            "모르는 것은 모른다고 쓰고, 무엇을 확인해야 하는지로 대신하십시오. "
+            "한국어, 마크다운, 250자 내외.\n")
+    return ctx
+
+
+def run_persona(api_key: str, model: str, persona: dict, context: str):
+    from groq import Groq
+    log("페르소나", "호출", 이름=persona["name"], 모델=model)
+    stream = Groq(api_key=api_key).chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": persona["system"]},
+                  {"role": "user", "content": context + "\n[당신의 과제]\n" + persona["task"]}],
+        temperature=0.3, max_tokens=700, stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+def run_synthesis(api_key: str, model: str, context: str, opinions: dict):
+    from groq import Groq
+    joined = "\n\n".join(f"### {k}\n{v}" for k, v in opinions.items())
+    prompt = (context + "\n[다섯 전문가의 의견]\n" + joined +
+              "\n\n[당신의 과제]\n위 의견들이 어디서 갈리는지 먼저 짚고, 합의된 부분과 "
+              "충돌하는 부분을 구분하십시오. 그다음 실행 가능한 결론을 쓰십시오: "
+              "① 지금 행동할 것인가 기다릴 것인가 ② 기다린다면 무엇을 보고 움직일 것인가 "
+              "③ 행동한다면 최대 배분 비율. 낙관도 비관도 아닌 조건부 서술로. 400자 내외.")
+    stream = Groq(api_key=api_key).chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content":
+                   "당신은 다섯 전문가의 의견을 조율하는 최종 의사결정자입니다. "
+                   "합의를 억지로 만들지 않고, 의견이 갈리는 지점을 그대로 드러냅니다. "
+                   "결론은 항상 조건부로 서술합니다."},
+                  {"role": "user", "content": prompt}],
+        temperature=0.25, max_tokens=900, stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 사이드바
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1009,9 +1482,10 @@ st.write("")
 # 탭
 # ──────────────────────────────────────────────────────────────────────────────
 
-tabs = st.tabs(["캔들 차트", "수급 상세", "기타법인 추적", "백테스트", "AI 리포트", "진단"])
+(tab_chart, tab_flow, tab_corp, tab_screen, tab_persona, tab_bt, tab_diag) = st.tabs(
+    ["캔들 차트", "수급 상세", "기타법인 추적", "종목 스크리너", "페르소나 회의", "백테스트", "진단"])
 
-with tabs[0]:
+with tab_chart:
     opt = st.columns([2.2, 1, 1])
     picks = opt[0].multiselect("수급 패널에 표시할 투자자", INVESTORS, default=INVESTORS)
     mode_label = opt[1].radio("표시 방식", ["겹쳐보기", "나란히"], horizontal=True)
@@ -1036,7 +1510,7 @@ with tabs[0]:
         "'겹쳐보기'로 두면 위쪽이 매수 주체, 아래쪽이 매도 주체로 갈려 한눈에 들어옵니다.",
         icon="ℹ️")
 
-with tabs[1]:
+with tab_flow:
     m = st.columns(4)
     m[0].metric("외국인 연속 순매수", f"{sig['streak_foreign']}일")
     corr = sig["corr_foreign_index"]
@@ -1098,7 +1572,7 @@ with tabs[1]:
     st.download_button("CSV 내려받기", data=show.to_csv().encode("utf-8-sig"),
                        file_name=f"kospi_flow_{last:%Y%m%d}.csv", mime="text/csv")
 
-with tabs[2]:
+with tab_corp:
     st.markdown("### 기타법인은 누구인가")
     st.markdown(
         "KRX 분류에서 **기타법인**은 금융기관이 아닌 일반 법인입니다. 사업회사, 지주회사, "
@@ -1167,7 +1641,7 @@ with tabs[2]:
     else:
         st.caption("위 버튼을 눌러 조회하세요. 종목 단위 집계라 시장 전체보다 응답이 조금 느립니다.")
 
-with tabs[3]:
+with tab_bt:
     st.markdown("### 스코어가 실제로 의미가 있었는가")
     st.markdown(
         "현재 조회 구간에서 스코어 구간별로 N영업일 뒤 코스피 수익률을 집계합니다. "
@@ -1206,34 +1680,7 @@ with tabs[3]:
     elif bt:
         st.info("집계할 표본이 부족합니다. 기간을 늘려 보세요.")
 
-with tabs[4]:
-    if not groq_api_key:
-        st.info("Groq API Key 를 입력하면 LLM 리포트가 추가됩니다.", icon="🔑")
-    else:
-        ca, cb = st.columns([1, 3])
-        use_corp = cb.checkbox("기타법인 상위 종목을 프롬프트에 포함", value=True,
-                               help="'기타법인 추적' 탭에서 조회한 결과가 있으면 함께 전달합니다.")
-        if ca.button("리포트 생성", type="primary", use_container_width=True):
-            model, available = resolve_groq_model(groq_api_key, model_choice)
-            cb.caption(f"모델: `{model}`" + (f" · {len(available)}개 사용 가능" if available else ""))
-            corp_top = st.session_state.get("corp_top") if use_corp else None
-            if corp_top is not None and st.session_state.get("corp_inv") != "기타법인":
-                corp_top = None
-            try:
-                text = st.write_stream(stream_report(
-                    groq_api_key, model,
-                    build_prompt(df, sig, guide, cash_ratio, corp_top)))
-                st.session_state["report"] = {"text": text, "model": model, "at": now_kst()}
-                log("LLM", "리포트 생성 완료", 길이=len(text))
-            except Exception as e:  # noqa: BLE001
-                log_exc("LLM", e, "리포트 생성 실패")
-                st.error(f"리포트 생성 실패 — {type(e).__name__}: {e}")
-        elif st.session_state.get("report"):
-            r = st.session_state["report"]
-            st.caption(f"모델: `{r['model']}` · 생성 {r['at']:%Y-%m-%d %H:%M} KST")
-            st.markdown(r["text"])
-
-with tabs[5]:
+with tab_diag:
     s1, s2 = st.columns(2)
     s1.markdown("**KRX 인증**")
     s1.json(meta.get("인증", AUTH_STATE))
@@ -1268,6 +1715,167 @@ with tabs[5]:
             except Exception as e:  # noqa: BLE001
                 env[mod] = f"import 실패: {e}"
         st.json(env)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 종목 스크리너 탭
+# ──────────────────────────────────────────────────────────────────────────────
+
+with tab_screen:
+    st.markdown("### 수급 기반 종목 후보 선별")
+    st.markdown(
+        "시장 전체를 8회 호출로 훑어 **순매수를 시가총액 대비 비율로** 환산합니다. "
+        "절대 금액으로 줄 세우면 대형주만 남아 정보가 없기 때문입니다. "
+        "여기서 나오는 것은 매수 추천이 아니라 **확인해 볼 가치가 있는 후보 목록**입니다."
+    )
+
+    f = st.columns(5)
+    mode = f[0].selectbox("전략", ["낙폭과대 반등", "추세 지속"])
+    n_pick = f[1].number_input("종목 수", 5, 30, 10, step=1)
+    min_cap = f[2].number_input("최소 시총(억)", 500, 100000, 3000, step=500)
+    min_val = f[3].number_input("최소 거래대금(억)", 1, 5000, 20, step=5)
+    sc_days = f[4].number_input("수급 집계일", 5, 60, 20, step=5)
+
+    if st.button("종목 스크리닝 실행", type="primary"):
+        try:
+            with st.spinner("시장 전체 스냅샷을 수집하는 중… (8회 호출)"):
+                uni = load_universe(int(sc_days), 60, krx_id)
+            res = screen_stocks(uni, mode, int(min_cap), int(min_val))
+            st.session_state["screen"] = {
+                "res": res, "mode": mode, "n": int(n_pick),
+                "days": int(sc_days), "base": uni["기준일"].iloc[0] if len(uni) else "",
+                "universe_n": len(uni), "filtered_n": len(res),
+            }
+        except Exception as e:  # noqa: BLE001
+            log_exc("스크리너", e, "스크리닝 실패")
+            st.error(f"스크리닝 실패 — {type(e).__name__}: {e}")
+
+    sc = st.session_state.get("screen")
+    if sc and not sc["res"].empty:
+        picks = sc["res"].head(sc["n"])
+        st.session_state["picks"] = picks
+        st.caption(
+            f"기준일 {sc['base']} · 전체 {sc['universe_n']}종목 → 필터 통과 {sc['filtered_n']}종목 "
+            f"→ 상위 {len(picks)}종목 · 전략 '{sc['mode']}' · 수급 집계 {sc['days']}일"
+        )
+
+        view = picks[["종목명", "기회점수", "종가", "시가총액", "PBR", "PER",
+                      "단기등락률", "장기등락률", "순매수_기타법인", "순매수_외국인",
+                      "순매수_연기금", "매수주체수", "거래대금"]].copy()
+        view.columns = ["종목명", "점수", "종가", "시총(억)", "PBR", "PER",
+                        f"{sc['days']}일%", "60일%", "기타법인(억)", "외국인(억)",
+                        "연기금(억)", "매수주체", "거래대금(억)"]
+        st.dataframe(
+            view.style.format({
+                "점수": "{:.0f}", "종가": "{:,.0f}", "시총(억)": "{:,.0f}",
+                "PBR": "{:.2f}", "PER": "{:.1f}",
+                f"{sc['days']}일%": "{:+.1f}", "60일%": "{:+.1f}",
+                "기타법인(억)": "{:+,.0f}", "외국인(억)": "{:+,.0f}", "연기금(억)": "{:+,.0f}",
+                "매수주체": "{:.0f}", "거래대금(억)": "{:,.0f}"}, na_rep="—"),
+            use_container_width=True, height=min(460, 60 + 36 * len(view)))
+
+        st.markdown("#### 포착 근거와 시나리오")
+        for ticker, row in picks.iterrows():
+            sc_dict = build_scenario(row, sc["mode"], sc["days"], 60)
+            head = (f"{row['종목명']} ({ticker}) · 점수 {row['기회점수']:.0f} · "
+                    f"{row['종가']:,.0f}원 · 60일 {row['장기등락률']:+.1f}%")
+            with st.expander(head):
+                a, b = st.columns([1, 1])
+                with a:
+                    st.markdown("**포착 이유**")
+                    for r in sc_dict["reasons"]:
+                        st.markdown(f"- {r}")
+                    st.markdown("**강세 시나리오**")
+                    st.markdown(sc_dict["bull"])
+                with b:
+                    st.markdown("**진입 구상**")
+                    st.markdown(sc_dict["entry"])
+                    st.markdown("**무효화 조건**")
+                    st.markdown(f":red[{sc_dict['invalid']}]")
+                    st.markdown("**직접 확인할 것**")
+                    for c_ in sc_dict["checks"]:
+                        st.markdown(f"- {c_}")
+
+        st.download_button("후보 CSV 내려받기",
+                           data=view.to_csv().encode("utf-8-sig"),
+                           file_name=f"screen_{now_kst():%Y%m%d_%H%M}.csv", mime="text/csv")
+
+        st.warning(
+            "이 목록은 공개 수급·시세·재무 데이터에 고정 규칙을 적용한 산술 결과입니다. "
+            "뉴스, 실적 발표, 공시, 업황, 지배구조는 전혀 반영되어 있지 않습니다. "
+            "종목 단위 점수는 백테스트로 검증된 바 없으며, 시장 스코어와 달리 검증 수단도 "
+            "아직 없습니다. 실제 매매 전에 각 종목의 공시와 실적을 직접 확인하십시오.",
+            icon="⚠️")
+    elif sc:
+        st.info("필터를 통과한 종목이 없습니다. 최소 시총·거래대금을 낮춰 보세요.")
+    else:
+        st.caption("조건을 정하고 버튼을 누르세요. 결과는 30분간 캐시됩니다.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 페르소나 회의 탭
+# ──────────────────────────────────────────────────────────────────────────────
+
+with tab_persona:
+    st.markdown("### 페르소나 회의")
+    st.markdown(
+        "같은 데이터를 다섯 명의 서로 다른 관점에 각각 넘기고, 마지막에 조율합니다. "
+        "합의를 만드는 것이 목적이 아니라 **어디서 의견이 갈리는지** 드러내는 것이 목적입니다."
+    )
+    pc = st.columns(len(PERSONAS))
+    for i, p in enumerate(PERSONAS):
+        pc[i].markdown(kpi(f"{p['icon']} {p['name']}", "", p["task"][:34] + "…", C_MUTED),
+                       unsafe_allow_html=True)
+    st.write("")
+
+    if not groq_api_key:
+        st.info("Groq API Key 를 입력하면 페르소나 회의를 실행할 수 있습니다.", icon="🔑")
+    else:
+        picks_df = st.session_state.get("picks")
+        oc = st.columns([1, 1, 2])
+        include = oc[0].checkbox("스크리너 결과 포함", value=picks_df is not None,
+                                 disabled=picks_df is None)
+        run_all = oc[1].button("회의 소집", type="primary", use_container_width=True)
+        if picks_df is None:
+            oc[2].caption("종목 스크리너를 먼저 실행하면 종목별 의견까지 받을 수 있습니다.")
+
+        if run_all:
+            model, available = resolve_groq_model(groq_api_key, model_choice)
+            st.caption(f"모델 `{model}` · 호출 {len(PERSONAS) + 1}회")
+            ctx = persona_context(
+                df, sig, guide, cash_ratio,
+                picks_df if include else None,
+                st.session_state.get("screen", {}).get("mode", "-"))
+            opinions: dict[str, str] = {}
+            for p in PERSONAS:
+                st.markdown(f"#### {p['icon']} {p['name']}")
+                try:
+                    opinions[p["name"]] = st.write_stream(
+                        run_persona(groq_api_key, model, p, ctx))
+                except Exception as e:  # noqa: BLE001
+                    log_exc("페르소나", e, f"{p['name']} 실패")
+                    st.error(f"{p['name']} 실패 — {type(e).__name__}: {e}")
+            if opinions:
+                st.divider()
+                st.markdown("#### ⚖️ 종합 판정")
+                try:
+                    final = st.write_stream(run_synthesis(groq_api_key, model, ctx, opinions))
+                    st.session_state["council"] = {
+                        "opinions": opinions, "final": final,
+                        "model": model, "at": now_kst()}
+                except Exception as e:  # noqa: BLE001
+                    log_exc("페르소나", e, "종합 판정 실패")
+                    st.error(f"종합 판정 실패 — {type(e).__name__}: {e}")
+        elif st.session_state.get("council"):
+            cl = st.session_state["council"]
+            st.caption(f"모델 `{cl['model']}` · 생성 {cl['at']:%Y-%m-%d %H:%M} KST")
+            for name, text in cl["opinions"].items():
+                icon = next((p["icon"] for p in PERSONAS if p["name"] == name), "•")
+                with st.expander(f"{icon} {name}"):
+                    st.markdown(text)
+            st.markdown("#### ⚖️ 종합 판정")
+            st.markdown(cl["final"])
+
 
 st.divider()
 st.markdown(
