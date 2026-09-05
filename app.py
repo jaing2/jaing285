@@ -1161,6 +1161,14 @@ def load_universe(short_days: int, long_days: int, auth_key: str) -> pd.DataFram
 
     uni["시가총액"] = uni["시가총액"] / 1e8      # 억원
     uni["거래대금"] = uni["거래대금"] / 1e8      # 억원
+    try:
+        ex = load_extras(auth_key)
+        for c_ in ex.columns:
+            uni[c_] = pd.to_numeric(ex[c_], errors="coerce").reindex(uni.index)
+        log("스크리너", "보강 지표 결합", 컬럼=",".join(ex.columns) or "없음")
+    except Exception as e:  # noqa: BLE001
+        log_exc("스크리너", e, "보강 지표 결합 실패")
+
     uni["기준일"] = end
     log("스크리너", "유니버스 완성", 종목수=len(uni))
     return uni
@@ -1443,6 +1451,11 @@ def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
 
     리밸런스 1회당 KRX 호출 약 8회. 시간이 걸리므로 2시간 캐시합니다.
     """
+    if mode in TECH_MODES:
+        raise RuntimeError(
+            "기술적 전략은 백테스트를 지원하지 않습니다. 과거 시점의 후보를 오늘의 수급으로 "
+            "고르면 미래 정보가 새어 들어가고(lookahead bias), 시점마다 전종목 224일 시세를 "
+            "다시 받으면 호출량이 수천 회가 됩니다. 수급 전략으로 먼저 검증하세요.")
     stock = get_stock_api()
     end = _latest_bday()
     span = (rebalances + 2) * hold_days + sc_days + 80
@@ -1523,8 +1536,10 @@ def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
                 "코스피(%)": round(bench, 2), "초과(%)": round(net - bench, 2),
                 "승률(%)": round((r > cost).mean() * 100, 1),
             })
-            for t_, v_ in r.items():
-                recs.append({"기간": f"{d0:%Y-%m-%d}", "티커": t_, "수익률": v_})
+            all_r = fret.reindex(ranked.index).dropna()
+            for t_, v_ in all_r.items():
+                recs.append({"기간": f"{d0:%Y-%m-%d}", "티커": t_, "수익률": float(v_),
+                             "점수": float(ranked.loc[t_, "기회점수"]), "코스피": bench})
             log("스크리너BT", f"{n+1}/{len(idxs)} 완료", 진입일=f"{d0:%Y-%m-%d}",
                 평균=f"{r.mean():.2f}%", 코스피=f"{bench:.2f}%")
         except Exception as e:  # noqa: BLE001
@@ -1887,6 +1902,246 @@ CHART_PERSONA = {
 }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 실증 상승확률 — 점수가 아니라 과거 결과에서 뽑아냅니다
+# ──────────────────────────────────────────────────────────────────────────────
+
+SCORE_BANDS = [(90, 101, "90+"), (80, 90, "80-89"), (70, 80, "70-79"),
+               (60, 70, "60-69"), (0, 60, "60미만")]
+
+
+def score_band(score: float) -> str:
+    for lo, hi, name in SCORE_BANDS:
+        if lo <= score < hi:
+            return name
+    return "60미만"
+
+
+def hit_rate_table(records: pd.DataFrame, cost_pct: float) -> pd.DataFrame:
+    """
+    백테스트에서 관측된 (점수, 실제 수익률) 쌍으로 점수대별 승률을 만듭니다.
+    이것이 화면에 표시되는 '상승확률'의 유일한 근거입니다.
+    """
+    if records is None or records.empty or "점수" not in records.columns:
+        return pd.DataFrame()
+    d = records.dropna(subset=["점수", "수익률"]).copy()
+    d["순수익"] = d["수익률"] - cost_pct
+    d["구간"] = d["점수"].map(score_band)
+    rows = []
+    for _, _, name in SCORE_BANDS:
+        g = d[d["구간"] == name]
+        if len(g) < 5:
+            continue
+        row = {"구간": name, "표본": len(g),
+               "상승확률(%)": round((g["순수익"] > 0).mean() * 100, 1),
+               "평균수익(%)": round(g["순수익"].mean(), 2)}
+        if "코스피" in g.columns:
+            row["코스피이김(%)"] = round((g["순수익"] > g["코스피"]).mean() * 100, 1)
+            row["평균초과(%)"] = round((g["순수익"] - g["코스피"]).mean(), 2)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def hit_rate_lookup(score: float, table: pd.DataFrame) -> dict:
+    if table is None or table.empty:
+        return {}
+    hit = table[table["구간"] == score_band(score)]
+    return hit.iloc[0].to_dict() if not hit.empty else {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 유니버스 보강 — 공매도 잔고와 외국인 한도소진율
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_extras(auth_key: str) -> pd.DataFrame:
+    """
+    공매도 잔고 비중과 외국인 지분율. 각각 1회 호출로 전종목을 받습니다.
+    실패해도 스크리너 본체는 그대로 동작하도록 빈 표를 돌려줍니다.
+    """
+    stock = get_stock_api()
+    date = _latest_bday()
+    out = pd.DataFrame()
+
+    try:
+        with capture_stdout("보강"):
+            sb = _retry(lambda: stock.get_shorting_balance_by_ticker(date, "KOSPI"), "보강", tries=2)
+        col = _pick(sb.columns, "비중")
+        if col is not None:
+            out["공매도비중"] = pd.to_numeric(sb[col], errors="coerce")
+        log("보강", "공매도 잔고 수신", 종목수=len(sb))
+    except Exception as e:  # noqa: BLE001
+        log_exc("보강", e, "공매도 잔고 수집 실패")
+
+    try:
+        with capture_stdout("보강"):
+            fe = _retry(lambda: stock.get_exhaustion_rates_of_foreign_investment(date, "KOSPI"),
+                        "보강", tries=2)
+        for want, name in [("지분율", "외국인지분율"), ("한도소진율", "외국인한도소진율")]:
+            c_ = _pick(fe.columns, want)
+            if c_ is not None:
+                s_ = pd.to_numeric(fe[c_], errors="coerce")
+                out[name] = s_ if out.empty else s_.reindex(out.index)
+        log("보강", "외국인 지분 수신", 종목수=len(fe))
+    except Exception as e:  # noqa: BLE001
+        log_exc("보강", e, "외국인 지분 수집 실패")
+
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 종목별 일별 수급 — 매수가 붙는 중인지 식는 중인지
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_stock_flow(ticker: str, days: int, auth_key: str) -> pd.DataFrame:
+    stock = get_stock_api()
+    end = _latest_bday()
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y%m%d")
+    with capture_stdout("종목수급"):
+        df = _retry(lambda: stock.get_market_trading_value_by_date(start, end, ticker),
+                    "종목수급", tries=2)
+    if df is None or df.empty:
+        raise RuntimeError("종목 수급 데이터가 비어 있습니다")
+    out, _ = _normalize_flow(df)
+    log("종목수급", "수신", 티커=ticker, 행수=len(out))
+    return out
+
+
+def flow_momentum(flow: pd.DataFrame, short: int = 5) -> dict:
+    """최근 순매수가 가속 중인지 감속 중인지."""
+    res = {}
+    for who in ["외국인", "기관", "기타법인"]:
+        if who not in flow.columns:
+            continue
+        recent = flow[who].tail(short).sum()
+        prev = flow[who].iloc[-short * 2:-short].sum() if len(flow) >= short * 2 else float("nan")
+        tol = max(abs(prev) * 0.1, 1.0) if pd.notna(prev) else 0.0
+        if pd.isna(prev):
+            trend = "판정불가"
+        elif abs(recent - prev) <= tol:
+            trend = "매수유지" if recent > 0 else "매도유지" if recent < 0 else "중립"
+        elif recent > 0:
+            trend = "매수가속" if recent > prev else "매수둔화"
+        elif recent < 0:
+            trend = "매도가속" if recent < prev else "매도둔화"
+        else:
+            trend = "중립"
+        res[who] = {"최근": float(recent), "직전": float(prev) if pd.notna(prev) else float("nan"),
+                    "판정": trend}
+    return res
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 관심종목 / 보유종목 모니터
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_watchlist(tickers: tuple, days: int, auth_key: str) -> pd.DataFrame:
+    stock = get_stock_api()
+    end = _latest_bday()
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(days * 1.6) + 200)).strftime("%Y%m%d")
+    rows = []
+    prog = st.progress(0.0, text="관심종목을 불러오는 중…")
+    for i, t in enumerate(tickers):
+        try:
+            with capture_stdout("관심종목"):
+                px = _retry(lambda: stock.get_market_ohlcv(start, end, t), "관심종목", tries=2)
+                fl = _retry(lambda: stock.get_market_trading_value_by_date(start, end, t),
+                            "관심종목", tries=2)
+            close = pd.to_numeric(px[_pick(px.columns, "종가")], errors="coerce").dropna()
+            close.index = pd.to_datetime(px.index)[-len(close):]
+            vol = pd.to_numeric(px[_pick(px.columns, "거래량")], errors="coerce")
+            tech = compute_tech(close, vol)
+            f, _ = _normalize_flow(fl)
+            f = f.tail(days)
+            try:
+                name = stock.get_market_ticker_name(t)
+            except Exception:  # noqa: BLE001
+                name = t
+            rows.append({
+                "티커": t, "종목명": name, "종가": float(close.iloc[-1]),
+                "1일%": float(close.pct_change().iloc[-1] * 100),
+                f"{days}일%": float((close.iloc[-1] / close.iloc[-min(days, len(close))] - 1) * 100),
+                "배열": tech.get("배열", "—"), "RSI": tech.get("RSI", float("nan")),
+                "MA20이격%": ((float(close.iloc[-1]) / tech["MA20"] - 1) * 100
+                            if tech.get("MA20") else float("nan")),
+                "외국인(억)": float(f["외국인"].sum()) if "외국인" in f else 0.0,
+                "기관(억)": float(f["기관"].sum()) if "기관" in f else 0.0,
+                "기타법인(억)": float(f["기타법인"].sum()) if "기타법인" in f else 0.0,
+            })
+        except Exception as e:  # noqa: BLE001
+            log_exc("관심종목", e, f"{t} 실패")
+            rows.append({"티커": t, "종목명": "조회 실패", "종가": float("nan")})
+        prog.progress((i + 1) / len(tickers), text=f"{i+1}/{len(tickers)}")
+        time.sleep(0.12)
+    prog.empty()
+    return pd.DataFrame(rows).set_index("티커")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 매매 일지
+# ──────────────────────────────────────────────────────────────────────────────
+
+JOURNAL_COLS = ["티커", "종목명", "진입일", "계획진입가", "실제진입가", "수량",
+                "손절가", "목표가", "청산일", "청산가", "메모"]
+
+
+def empty_journal() -> pd.DataFrame:
+    return pd.DataFrame(columns=JOURNAL_COLS)
+
+
+def plan_to_journal(plan: pd.DataFrame) -> pd.DataFrame:
+    today = now_kst().strftime("%Y-%m-%d")
+    return pd.DataFrame([{
+        "티커": t, "종목명": r["종목명"], "진입일": today,
+        "계획진입가": r["진입가"], "실제진입가": float("nan"), "수량": r["수량"],
+        "손절가": r["손절가"], "목표가": r["목표가"],
+        "청산일": "", "청산가": float("nan"), "메모": "",
+    } for t, r in plan.iterrows()])
+
+
+def journal_stats(j: pd.DataFrame, fee_pct: float, tax_pct: float) -> pd.DataFrame:
+    """청산된 거래의 실현 손익과 R 배수를 계산합니다."""
+    if j is None or j.empty:
+        return pd.DataFrame()
+    d = j.copy()
+    for c in ["실제진입가", "청산가", "수량", "손절가", "계획진입가"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["진입가"] = d["실제진입가"].fillna(d["계획진입가"])
+    closed = d.dropna(subset=["청산가", "진입가", "수량"])
+    if closed.empty:
+        return pd.DataFrame()
+    gross = (closed["청산가"] - closed["진입가"]) * closed["수량"]
+    cost = (closed["진입가"] * closed["수량"] * fee_pct / 100
+            + closed["청산가"] * closed["수량"] * (fee_pct + tax_pct) / 100)
+    net = gross - cost
+    risk = (closed["진입가"] - closed["손절가"]) * closed["수량"]
+    out = closed[["종목명", "진입일", "청산일", "진입가", "청산가", "수량"]].copy()
+    out["실현손익"] = net.round(0)
+    out["수익률(%)"] = ((closed["청산가"] / closed["진입가"] - 1) * 100).round(2)
+    out["R배수"] = (net / risk.replace(0, float("nan"))).round(2)
+    return out
+
+
+def journal_summary(stats: pd.DataFrame) -> dict:
+    if stats is None or stats.empty:
+        return {}
+    win = stats[stats["실현손익"] > 0]
+    lose = stats[stats["실현손익"] <= 0]
+    avg_w = win["실현손익"].mean() if len(win) else 0.0
+    avg_l = abs(lose["실현손익"].mean()) if len(lose) else 0.0
+    wr = len(win) / len(stats)
+    return {
+        "거래수": len(stats),
+        "승률(%)": round(wr * 100, 1),
+        "누적손익": round(stats["실현손익"].sum(), 0),
+        "평균R": round(stats["R배수"].mean(), 2) if stats["R배수"].notna().any() else float("nan"),
+        "손익비": round(avg_w / avg_l, 2) if avg_l else float("nan"),
+        "기대값": round(wr * avg_w - (1 - wr) * avg_l, 0),
+        "최대손실": round(stats["실현손익"].min(), 0),
+    }
+
 # 판단 5인 + 실행 5인 + 차트 1인
 ALL_PERSONAS = PERSONAS + EXEC_PERSONAS + [CHART_PERSONA]
 
@@ -2029,9 +2284,10 @@ st.write("")
 # 탭
 # ──────────────────────────────────────────────────────────────────────────────
 
-(tab_chart, tab_flow, tab_corp, tab_screen, tab_plan, tab_persona, tab_bt, tab_diag) = st.tabs(
+(tab_chart, tab_flow, tab_corp, tab_screen, tab_plan, tab_watch,
+ tab_persona, tab_bt, tab_diag) = st.tabs(
     ["캔들 차트", "수급 상세", "기타법인 추적", "종목 스크리너", "매매 계획",
-     "페르소나 회의", "검증", "진단"])
+     "관심종목", "페르소나 회의", "검증", "진단"])
 
 with tab_chart:
     opt = st.columns([2.2, 1, 1])
@@ -2248,6 +2504,9 @@ with tab_bt:
                 sbt = screener_backtest(int(bt_reb), int(bt_hold), bt_mode, int(bt_top),
                                         3000, 20, 20, 0.015, 0.15, krx_id)
             st.session_state["sbt"] = sbt
+            hr = hit_rate_table(sbt["records"], 0.015 * 2 + 0.15)
+            st.session_state["hitrate"] = {"table": hr, "mode": bt_mode,
+                                           "hold": int(bt_hold)}
         except Exception as e:  # noqa: BLE001
             log_exc("스크리너BT", e, "백테스트 실패")
             st.error(f"백테스트 실패 — {type(e).__name__}: {e}")
@@ -2409,17 +2668,51 @@ with tab_screen:
             fmt.update({f"{sc['days']}일%": "{:+.1f}", "60일%": "{:+.1f}"})
         view = picks[cols_base].copy()
         view.columns = names_base
+        view.insert(0, "순위", range(1, len(view) + 1))
+        fmt["순위"] = "{:.0f}"
+
+        hr = st.session_state.get("hitrate")
+        if hr and not hr["table"].empty:
+            probs, wins = [], []
+            for sc_ in picks["기회점수"]:
+                h_ = hit_rate_lookup(sc_, hr["table"])
+                probs.append(h_.get("상승확률(%)", float("nan")))
+                wins.append(h_.get("코스피이김(%)", float("nan")))
+            view.insert(2, "상승확률(%)", probs)
+            view.insert(3, "코스피이김(%)", wins)
+            fmt.update({"상승확률(%)": "{:.0f}", "코스피이김(%)": "{:.0f}"})
+            st.caption(
+                f"상승확률은 검증 탭 백테스트('{hr['mode']}', {hr['hold']}영업일 보유)에서 "
+                "관측된 **같은 점수대 종목들의 실제 상승 비율**입니다. 제 점수 공식이 아니라 "
+                "과거 결과입니다. 표본이 적으면 신뢰하지 마세요.")
+        else:
+            st.info(
+                "상승확률 컬럼은 검증 탭에서 백테스트를 먼저 실행해야 나타납니다. "
+                "점수는 상대 순위일 뿐이라 확률로 바꾸려면 과거 결과가 필요합니다.", icon="📐")
+
         st.dataframe(view.style.format(fmt, na_rep="—"),
                      use_container_width=True, height=min(460, 60 + 36 * len(view)))
 
+        if hr and not hr["table"].empty:
+            with st.expander("점수대별 실측 승률 (백테스트 원본)"):
+                st.dataframe(hr["table"], use_container_width=True, hide_index=True)
+                st.caption("점수가 높을수록 상승확률이 단조 증가하지 않으면, "
+                           "그 점수는 순위를 매기는 의미가 없습니다.")
+
         st.markdown("#### 포착 근거와 시나리오")
-        for ticker, row in picks.iterrows():
+        for rank_, (ticker, row) in enumerate(picks.iterrows(), 1):
             sc_dict = (tech_scenario(row, sc["mode"]) if sc.get("tech")
                        else build_scenario(row, sc["mode"], sc["days"], 60))
             tail = (f"{row['배열']} · RSI {row['RSI']:.0f}" if sc.get("tech")
                     else f"60일 {row['장기등락률']:+.1f}%")
-            head = (f"{row['종목명']} ({ticker}) · 점수 {row['기회점수']:.0f} · "
-                    f"{row['종가']:,.0f}원 · {tail}")
+            extras = []
+            if pd.notna(row.get("공매도비중")):
+                extras.append(f"공매도 {row['공매도비중']:.2f}%")
+            if pd.notna(row.get("외국인지분율")):
+                extras.append(f"외인지분 {row['외국인지분율']:.1f}%")
+            head = (f"{rank_}위 · {row['종목명']} ({ticker}) · 점수 {row['기회점수']:.0f} · "
+                    f"{row['종가']:,.0f}원 · {tail}"
+                    + (" · " + " · ".join(extras) if extras else ""))
             with st.expander(head):
                 a, b = st.columns([1, 1])
                 with a:
@@ -2447,6 +2740,38 @@ with tab_screen:
                                             key=f"tf_{ticker}")
                         except Exception as e:  # noqa: BLE001
                             st.caption(f"차트 생성 실패: {e}")
+
+        st.divider()
+        st.markdown("#### 종목 심층 — 일별 수급 추이")
+        st.caption("기간 합계로는 알 수 없는 것: 매수가 붙는 중인지 식는 중인지.")
+        dsel = st.selectbox("종목 선택",
+                            [f"{r['종목명']} ({t})" for t, r in picks.iterrows()],
+                            key="deep_sel")
+        dtick = dsel.split("(")[-1].rstrip(")")
+        if st.button("일별 수급 조회", key="deep_btn"):
+            try:
+                with st.spinner("종목 수급을 불러오는 중…"):
+                    fl = load_stock_flow(dtick, 60, krx_id)
+                st.session_state["deep"] = {"ticker": dtick, "flow": fl, "label": dsel}
+            except Exception as e:  # noqa: BLE001
+                log_exc("종목수급", e, "조회 실패")
+                st.error(f"조회 실패 — {type(e).__name__}: {e}")
+
+        dp = st.session_state.get("deep")
+        if dp and dp["ticker"] == dtick:
+            fl = dp["flow"]
+            mom = flow_momentum(fl, 5)
+            mc = st.columns(3)
+            for i_, (who, m_) in enumerate(mom.items()):
+                tone = (C_UP if m_["판정"] in ("가속", "둔화") else C_DOWN)
+                mc[i_].markdown(kpi(f"{who} · {m_['판정']}", f"{fmt_eok(m_['최근'])} 억",
+                                    f"직전 5일 {fmt_eok(m_['직전'])} 억", tone),
+                                unsafe_allow_html=True)
+            st.markdown(f"**{dp['label']} 일별 순매수 (억원)**")
+            cols_f = [c for c in INVESTORS if c in fl.columns]
+            st.bar_chart(fl[cols_f], color=SERIES_COLORS[:len(cols_f)], height=260)
+            st.markdown("**기간 누적**")
+            st.area_chart(fl[cols_f].cumsum(), color=SERIES_COLORS[:len(cols_f)], height=220)
 
         st.download_button("후보 CSV 내려받기",
                            data=view.to_csv().encode("utf-8-sig"),
@@ -2659,6 +2984,124 @@ with tab_plan:
                 st.success("체크리스트 완료. 계획대로 집행하세요.", icon="✅")
             else:
                 st.caption(f"{sum(done)}/{len(checks)} 완료 — 전부 확인하기 전에는 주문하지 마세요.")
+
+    st.divider()
+    st.markdown("### 매매 일지")
+    st.markdown(
+        "몇 달 쌓이면 이게 이 시스템의 **진짜 백테스트**가 됩니다. 과거 데이터로 돌린 것보다 "
+        "정직한 숫자입니다. 서버에 저장되지 않으니 CSV 로 내려받아 보관하고, 다음에 올려서 이어가세요."
+    )
+    if "journal" not in st.session_state:
+        st.session_state["journal"] = empty_journal()
+
+    jc = st.columns([1, 1, 2])
+    up = jc[0].file_uploader("기존 일지 CSV", type="csv", label_visibility="collapsed")
+    if up is not None:
+        try:
+            loaded = pd.read_csv(up, dtype={"티커": str})
+            st.session_state["journal"] = loaded.reindex(columns=JOURNAL_COLS)
+            st.success(f"{len(loaded)}건 불러왔습니다.")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"불러오기 실패: {e}")
+    pl_ = st.session_state.get("plan")
+    if jc[1].button("현재 계획을 일지에 추가", use_container_width=True,
+                    disabled=pl_ is None or pl_["plan"].empty):
+        st.session_state["journal"] = pd.concat(
+            [st.session_state["journal"], plan_to_journal(pl_["plan"])], ignore_index=True)
+        st.rerun()
+    jc[2].caption("실제진입가·청산일·청산가를 직접 채우면 아래 성과가 계산됩니다.")
+
+    edited = st.data_editor(st.session_state["journal"], num_rows="dynamic",
+                            use_container_width=True, height=300, key="journal_editor")
+    st.session_state["journal"] = edited
+
+    stats = journal_stats(edited, fee_pct, tax_pct)
+    if not stats.empty:
+        summ = journal_summary(stats)
+        sc_ = st.columns(6)
+        sc_[0].markdown(kpi("거래 수", f"{summ['거래수']}", "청산 완료", C_MUTED),
+                        unsafe_allow_html=True)
+        sc_[1].markdown(kpi("승률", f"{summ['승률(%)']:.0f}%", "", tone_for(summ["승률(%)"] - 50)),
+                        unsafe_allow_html=True)
+        sc_[2].markdown(kpi("누적 손익", f"{summ['누적손익']/1e4:,.0f}만원", "",
+                            tone_for(summ["누적손익"])), unsafe_allow_html=True)
+        sc_[3].markdown(kpi("평균 R", f"{summ['평균R']:.2f}", "손절폭 대비 배수",
+                            tone_for(summ["평균R"])), unsafe_allow_html=True)
+        sc_[4].markdown(kpi("손익비", f"{summ['손익비']:.2f}", "평균이익 ÷ 평균손실",
+                            tone_for(summ["손익비"] - 1)), unsafe_allow_html=True)
+        sc_[5].markdown(kpi("기대값", f"{summ['기대값']/1e4:,.0f}만원", "1거래당",
+                            tone_for(summ["기대값"])), unsafe_allow_html=True)
+        st.dataframe(stats, use_container_width=True, hide_index=True, height=240)
+        if summ["거래수"] < 20:
+            st.caption("거래 20건 미만은 통계로 보기 어렵습니다. 운과 실력이 구분되지 않습니다.")
+        elif pd.notna(summ["평균R"]) and summ["평균R"] < 0:
+            st.error("평균 R 이 음수입니다. 규칙이 아니라 규칙을 지켰는지부터 점검하세요.", icon="🛑")
+
+    st.download_button("일지 CSV 내려받기",
+                       data=edited.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"journal_{now_kst():%Y%m%d}.csv", mime="text/csv")
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 관심종목 / 보유종목 모니터
+# ──────────────────────────────────────────────────────────────────────────────
+
+with tab_watch:
+    st.markdown("### 관심종목 모니터")
+    st.markdown("보유 중이거나 지켜보는 종목의 수급과 차트 상태를 한 화면에서 봅니다.")
+
+    wc = st.columns([3, 1, 1])
+    raw = wc[0].text_input("종목코드 (쉼표 구분, 최대 15개)",
+                           placeholder="005930, 000660, 035420")
+    w_days = wc[1].number_input("수급 집계일", 5, 60, 20, step=5, key="w_days")
+    go = wc[2].button("조회", type="primary", use_container_width=True)
+
+    pl_ = st.session_state.get("plan")
+    if pl_ is not None and not pl_["plan"].empty:
+        st.caption("계획 종목: " + ", ".join(pl_["plan"].index[:15]))
+
+    if go and raw.strip():
+        ticks = tuple(t.strip().zfill(6) for t in raw.replace(" ", "").split(",")
+                      if t.strip())[:15]
+        try:
+            wl = load_watchlist(ticks, int(w_days), krx_id)
+            st.session_state["watch"] = wl
+        except Exception as e:  # noqa: BLE001
+            log_exc("관심종목", e, "조회 실패")
+            st.error(f"조회 실패 — {type(e).__name__}: {e}")
+
+    wl = st.session_state.get("watch")
+    if wl is not None and not wl.empty:
+        dcol = f"{int(w_days)}일%" if f"{int(w_days)}일%" in wl.columns else None
+        fmt_w = {"종가": "{:,.0f}", "1일%": "{:+.2f}", "RSI": "{:.0f}",
+                 "MA20이격%": "{:+.1f}", "외국인(억)": "{:+,.0f}",
+                 "기관(억)": "{:+,.0f}", "기타법인(억)": "{:+,.0f}"}
+        if dcol:
+            fmt_w[dcol] = "{:+.1f}"
+        st.dataframe(wl.style.format(fmt_w, na_rep="—"),
+                     use_container_width=True, height=min(520, 60 + 36 * len(wl)))
+
+        ok = wl.dropna(subset=["종가"])
+        if not ok.empty:
+            k = st.columns(4)
+            k[0].markdown(kpi("정배열 종목", f"{(ok['배열'] == '정배열').sum()}/{len(ok)}",
+                              "나머지는 혼조·역배열", C_UP), unsafe_allow_html=True)
+            k[1].markdown(kpi("외국인 순매수 종목", f"{(ok['외국인(억)'] > 0).sum()}/{len(ok)}",
+                              f"최근 {int(w_days)}일", C_UP), unsafe_allow_html=True)
+            over = ok[ok["RSI"] > 70]
+            k[2].markdown(kpi("RSI 70 초과", f"{len(over)}종목",
+                              ", ".join(over["종목명"].head(3)) or "없음", C_ACCENT),
+                          unsafe_allow_html=True)
+            under = ok[ok["RSI"] < 30]
+            k[3].markdown(kpi("RSI 30 미만", f"{len(under)}종목",
+                              ", ".join(under["종목명"].head(3)) or "없음", C_DOWN),
+                          unsafe_allow_html=True)
+
+        st.download_button("관심종목 CSV", data=wl.to_csv().encode("utf-8-sig"),
+                           file_name=f"watch_{now_kst():%Y%m%d}.csv", mime="text/csv")
+    else:
+        st.caption("종목코드를 입력하고 조회를 누르세요. 종목당 2회 호출이라 15개면 30회입니다.")
 
 
 st.divider()
