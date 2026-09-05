@@ -1218,19 +1218,22 @@ def screen_stocks(uni: pd.DataFrame, mode: str, min_cap: int, min_value: int,
 
     pct = lambda s: s.rank(pct=True) * 100  # noqa: E731
 
-    score = pct(d["수급강도"]) * 0.35
-    score += (d["매수주체수"] / 4 * 100) * 0.15
-    pbr_rank = (1 - d["PBR"].rank(pct=True)) * 100
-    score += pbr_rank.fillna(50) * 0.15
-
+    # 각 항목은 '유니버스 안에서의 백분위'입니다. 절대 기준이 아니라 상대 순위입니다.
+    comp = {
+        "수급(35)": pct(d["수급강도"]) * 0.35,
+        "주체(15)": (d["매수주체수"] / 4 * 100) * 0.15,
+        "밸류(15)": ((1 - d["PBR"].rank(pct=True)) * 100).fillna(50) * 0.15,
+    }
     if mode == "낙폭과대 반등":
-        score += (1 - d["장기등락률"].rank(pct=True)) * 100 * 0.20   # 많이 빠진 종목
-        score += pct(d["단기등락률"] - d["장기등락률"]) * 0.15        # 최근 개선
+        comp["낙폭(20)"] = (1 - d["장기등락률"].rank(pct=True)) * 100 * 0.20
+        comp["회복(15)"] = pct(d["단기등락률"] - d["장기등락률"]) * 0.15
     else:  # 추세 지속
-        score += pct(d["장기등락률"]) * 0.20
-        score += pct(d["단기등락률"]) * 0.15
+        comp["추세(20)"] = pct(d["장기등락률"]) * 0.20
+        comp["단기(15)"] = pct(d["단기등락률"]) * 0.15
 
-    d["기회점수"] = score.round(1)
+    for k_, v_ in comp.items():
+        d[f"점수_{k_}"] = v_.round(1)
+    d["기회점수"] = sum(comp.values()).round(1)
     return d.sort_values("기회점수", ascending=False)
 
 
@@ -1648,7 +1651,39 @@ def exec_context(plan: pd.DataFrame, capital: float, gate: float, gate_label: st
 # 기술적 지표
 # ──────────────────────────────────────────────────────────────────────────────
 
-MA_SET = (5, 20, 60, 120)
+# 이동평균 기간. 사이드바에서 바꿀 수 있으며, 개수 제한이 없습니다.
+MA_SET = (5, 20, 60, 112, 224)
+MA_PRESETS = {
+    "5 · 20 · 60 · 112 · 224": (5, 20, 60, 112, 224),
+    "5 · 20 · 60 · 120": (5, 20, 60, 120),
+    "5 · 20 · 60 · 120 · 240": (5, 20, 60, 120, 240),
+    "5 · 10 · 20 · 60 · 120": (5, 10, 20, 60, 120),
+    "3 · 5 · 10 · 20": (3, 5, 10, 20),
+}
+MA_LINE_COLORS = ["#E6EDF3", "#F5A524", "#30A46C", "#8E4EC6", "#0BA5B7", "#F76808"]
+
+
+def ma_fast() -> int:
+    return MA_SET[0]
+
+
+def ma_mid() -> int:
+    """중기선. 눌림목·기울기 판단의 기준선입니다."""
+    return MA_SET[1] if len(MA_SET) > 1 else MA_SET[0]
+
+
+def ma_slow() -> int:
+    """중장기선. 추세 회복 여부의 기준선입니다."""
+    return MA_SET[2] if len(MA_SET) > 2 else MA_SET[-1]
+
+
+def ma_long() -> int:
+    return MA_SET[-1]
+
+
+def ma_min_len() -> int:
+    """지표를 산출하려면 최소한 가장 긴 이동평균 기간만큼의 시세가 필요합니다."""
+    return max(MA_SET) + 5
 TECH_MODES = ["역배열→정배열 전환", "MACD 골든크로스", "RSI 과매도 반등"]
 ALL_MODES = ["낙폭과대 반등", "추세 지속"] + TECH_MODES
 
@@ -1680,13 +1715,17 @@ def compute_tech(close: pd.Series, volume: Optional[pd.Series] = None) -> dict:
     이동평균·MACD 는 모두 후행 지표입니다. 전환을 '예측'하는 것이 아니라
     '이미 일어난 전환을 확인'하는 용도로 씁니다.
     """
-    if len(close) < 130:
+    if len(close) < ma_min_len():
         return {}
     ma = {n: close.rolling(n).mean() for n in MA_SET}
-    m5, m20, m60, m120 = (ma[n] for n in MA_SET)
+    pairs = list(zip(MA_SET[:-1], MA_SET[1:]))
+    max_steps = max(1, len(pairs))
 
-    bull = (m5 > m20) & (m20 > m60) & (m60 > m120)      # 정배열
-    bear = (m5 < m20) & (m20 < m60) & (m60 < m120)      # 역배열
+    bull = pd.Series(True, index=close.index)
+    bear = pd.Series(True, index=close.index)
+    for a_, b_ in pairs:
+        bull &= ma[a_] > ma[b_]
+        bear &= ma[a_] < ma[b_]
 
     line, signal, hist = macd(close)
     r = rsi(close)
@@ -1699,8 +1738,8 @@ def compute_tech(close: pd.Series, volume: Optional[pd.Series] = None) -> dict:
         except Exception:  # noqa: BLE001
             return float("nan")
 
-    # 정배열이 몇 단계까지 회복됐는지 (0~3)
-    steps = int(at(m5) > at(m20)) + int(at(m20) > at(m60)) + int(at(m60) > at(m120))
+    # 정배열이 몇 단계까지 회복됐는지 (0 ~ 이동평균 개수-1)
+    steps = sum(int(at(ma[a_]) > at(ma[b_])) for a_, b_ in pairs)
     # 최근 60일 중 역배열이었던 비율 — 진짜 바닥에서 올라오는 것인지 확인
     bear_ratio = float(bear.tail(60).mean())
     # MACD 히스토그램이 음→양으로 바뀐 지 며칠 됐는가
@@ -1712,15 +1751,19 @@ def compute_tech(close: pd.Series, volume: Optional[pd.Series] = None) -> dict:
             flip = pos[::-1].idxmin() if (~pos).any() else None
             if flip is not None:
                 cross_age = float(len(h.loc[flip:]) - 1)
-    # MA20 기울기 (5일 변화율 %)
-    slope20 = ((at(m20) / at(m20, -6) - 1) * 100) if len(m20.dropna()) > 6 else float("nan")
+    # 중기선 기울기 (5일 변화율 %)
+    mid, slow = ma[ma_mid()], ma[ma_slow()]
+    slope_mid = ((at(mid) / at(mid, -6) - 1) * 100) if len(mid.dropna()) > 6 else float("nan")
 
     state = "정배열" if bool(bull.iloc[-1]) else "역배열" if bool(bear.iloc[-1]) else "혼조"
 
-    return {
-        "종가": at(close), "MA5": at(m5), "MA20": at(m20), "MA60": at(m60), "MA120": at(m120),
-        "배열": state, "정배열단계": steps, "역배열비율60": round(bear_ratio, 2),
-        "MA20기울기": slope20, "이격도60": (at(close) / at(m60) - 1) * 100 if at(m60) else float("nan"),
+    out = {f"MA{n}": at(ma[n]) for n in MA_SET}
+    out.update({
+        "종가": at(close), "MA중기": at(mid), "MA장기": at(slow),
+        "배열": state, "정배열단계": steps, "배열단계최대": max_steps,
+        "역배열비율60": round(bear_ratio, 2),
+        "중기기울기": slope_mid,
+        "장기이격도": (at(close) / at(slow) - 1) * 100 if at(slow) else float("nan"),
         "MACD": at(line), "MACD시그널": at(signal), "MACD히스토": at(hist),
         "MACD전환일": cross_age, "RSI": at(r),
         "RSI최저20": float(r.tail(20).min()) if len(r.dropna()) > 20 else float("nan"),
@@ -1728,8 +1771,155 @@ def compute_tech(close: pd.Series, volume: Optional[pd.Series] = None) -> dict:
                   if volume is not None and len(volume) > 60 and volume.tail(60).mean() else float("nan")),
         "기준일": last,
         "series": {"close": close, "ma": ma, "macd": (line, signal, hist), "rsi": r},
+    })
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 차트 국면 세분류
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# 정배열/역배열/혼조 3분류는 너무 거칩니다. 특히 '혼조' 안에는 바닥을 다지는 종목과
+# 고점에서 무너지는 종목이 함께 들어가는데, 둘은 정반대 상황입니다.
+# 아래 다섯 축으로 나눠 본 뒤 이름을 붙입니다.
+#   ① 배열 단계(0~3)  ② 단계의 변화 방향  ③ 이동평균 기울기
+#   ④ 주가의 위치      ⑤ 이동평균 밀집도
+
+CHART_STATES = {
+    "완전정배열": "네 이동평균이 모두 순서대로 정렬되고 주가가 그 위에 있습니다. 추세가 살아 있는 구간입니다.",
+    "정배열 눌림목": "배열은 정배열인데 주가가 단기선 아래로 내려왔습니다. 조정인지 이탈인지는 20일선 지지 여부가 가릅니다.",
+    "상승전환 진행": "역배열에서 올라오는 중입니다. 단기·중기선은 넘었고 장기선이 남았습니다.",
+    "반등 초기": "단기선만 겨우 넘긴 상태입니다. 아직 되돌림 가능성이 큰 구간입니다.",
+    "바닥 다지기": "배열은 역배열이지만 20일선이 상승으로 돌아섰고 주가가 그 위에 있습니다.",
+    "완전역배열": "네 이동평균이 역순으로 정렬되어 있습니다. 하락 추세가 유지되는 구간입니다.",
+    "하락전환 진행": "정배열이 무너지는 중입니다. 단기선이 먼저 꺾였습니다.",
+    "수렴": "이동평균이 한곳에 모여 방향을 잃었습니다. 어느 쪽으로든 이탈 시 움직임이 커집니다.",
+    "혼조": "뚜렷한 배열이 없습니다. 판단을 보류할 구간입니다.",
+}
+
+
+def _slope(ma: pd.Series, look: int = 5) -> float:
+    s = ma.dropna()
+    if len(s) <= look:
+        return float("nan")
+    prev = float(s.iloc[-1 - look])
+    return (float(s.iloc[-1]) / prev - 1) * 100 if prev else float("nan")
+
+
+def _cross_age(fast: pd.Series, slow: pd.Series) -> tuple:
+    """빠른 선이 느린 선을 언제 넘었는지. (방향, 경과일)"""
+    rel = (fast > slow).dropna()
+    if len(rel) < 2:
+        return ("판정불가", float("nan"))
+    arr = rel.values
+    cur = bool(arr[-1])
+    flip = None
+    for i in range(len(arr) - 1, 0, -1):
+        if bool(arr[i]) != bool(arr[i - 1]):
+            flip = i
+            break
+    age = float(len(arr) - 1 - flip) if flip is not None else float("nan")
+    return ("골든크로스" if cur else "데드크로스", age)
+
+
+def classify_chart(close: pd.Series) -> dict:
+    """이동평균 구조를 다섯 축으로 분해하고 이름을 붙입니다."""
+    if close is None or len(close.dropna()) < ma_min_len():
+        return {}
+    c = close.dropna()
+    ma = {n: c.rolling(n).mean() for n in MA_SET}
+    pairs = list(zip(MA_SET[:-1], MA_SET[1:]))
+    max_steps = max(1, len(pairs))
+    price = float(c.iloc[-1])
+
+    steps_s = sum((ma[a_] > ma[b_]).astype(int) for a_, b_ in pairs)
+    steps = int(steps_s.iloc[-1])
+    steps_prev = int(steps_s.iloc[-21]) if len(steps_s) > 21 else steps
+    direction = "개선" if steps > steps_prev else "악화" if steps < steps_prev else "유지"
+
+    slopes = {n: _slope(ma[n]) for n in MA_SET}
+    above = sum(int(price > float(ma[n].iloc[-1])) for n in MA_SET
+                if pd.notna(ma[n].iloc[-1]))
+    now = {n: float(ma[n].iloc[-1]) for n in MA_SET if pd.notna(ma[n].iloc[-1])}
+    density = ((max(now.values()) - min(now.values())) / price * 100) if now else float("nan")
+
+    cross_fm = _cross_age(ma[ma_fast()], ma[ma_mid()])
+    cross_ms = _cross_age(ma[ma_mid()], ma[ma_slow()])
+
+    s20 = slopes.get(ma_mid(), float("nan"))
+    over20 = price > now.get(ma_mid(), price)
+    n_ma = len(MA_SET)
+
+    if pd.notna(density) and density < 2.0 and pd.notna(s20) and abs(s20) < 1.0:
+        name = "수렴"
+    elif steps == max_steps:
+        if above == n_ma and pd.notna(s20) and s20 > 0:
+            name = "완전정배열"
+        elif not over20:
+            name = "정배열 눌림목"
+        else:
+            name = "완전정배열"
+    elif steps >= max_steps - 1:
+        name = "상승전환 진행" if direction != "악화" else "하락전환 진행"
+    elif steps >= 1:
+        name = "반등 초기" if direction == "개선" else "하락전환 진행"
+    else:
+        if pd.notna(s20) and s20 > 0 and over20:
+            name = "바닥 다지기"
+        else:
+            name = "완전역배열"
+    if name not in CHART_STATES:
+        name = "혼조"
+
+    return {
+        "상태": name,
+        "설명": CHART_STATES[name],
+        "단계": steps,
+        "단계최대": max_steps,
+        "단계변화": f"{steps_prev} → {steps} ({direction})",
+        "방향": direction,
+        "기울기": slopes,
+        "주가위치": above,
+        "밀집도": density,
+        "이격": {n: (price / now[n] - 1) * 100 for n in now},
+        "크로스빠름": cross_fm, "크로스중기": cross_ms,
+        "크로스라벨": (f"{ma_fast()}·{ma_mid()}선 교차", f"{ma_mid()}·{ma_slow()}선 교차"),
+        "가격": price,
+        "이평": now,
     }
 
+
+def chart_summary_rows(cc: dict) -> list:
+    """세부 축을 화면용 문장으로."""
+    if not cc:
+        return []
+    up = lambda v: C_UP if pd.notna(v) and v > 0 else C_DOWN if pd.notna(v) else C_MUTED  # noqa: E731
+    rows = [
+        ("배열 단계", f"{cc['단계']}/{cc['단계최대']} · 20일 전 대비 {cc['단계변화']}",
+         C_UP if cc["방향"] == "개선" else C_DOWN if cc["방향"] == "악화" else C_MUTED),
+        ("주가 위치", f"이동평균 {len(MA_SET)}개 중 {cc['주가위치']}개 위" +
+         (" · 전부 위" if cc["주가위치"] == len(MA_SET)
+          else " · 전부 아래" if cc["주가위치"] == 0 else ""),
+         C_UP if cc["주가위치"] >= len(MA_SET) - 1
+         else C_DOWN if cc["주가위치"] <= 1 else C_ACCENT),
+    ]
+    sl = cc["기울기"]
+    slope_txt = " · ".join(f"MA{n} {sl[n]:+.1f}%" for n in MA_SET if pd.notna(sl.get(n)))
+    rows.append(("이평 기울기 (5일)", slope_txt or "산출 불가", up(sl.get(20))))
+    gap = cc["이격"]
+    gap_txt = " · ".join(f"MA{n} {gap[n]:+.1f}%" for n in MA_SET[1:] if n in gap)
+    g_mid = gap.get(ma_mid(), 0)
+    rows.append(("이격도", gap_txt or "산출 불가",
+                 C_DOWN if g_mid > 15 else C_UP if g_mid > 0 else C_MUTED))
+    d = cc["밀집도"]
+    dens = ("매우 밀집 — 방향 대기" if d < 2 else "밀집" if d < 5
+            else "보통" if d < 12 else "확산 — 추세 진행 중")
+    rows.append(("이평 밀집도", f"{d:.1f}% · {dens}", C_ACCENT))
+    lbl_a, lbl_b = cc["크로스라벨"]
+    for label, (kind, age) in [(lbl_a, cc["크로스빠름"]), (lbl_b, cc["크로스중기"])]:
+        txt = (f"{kind} {int(age)}일 경과" if pd.notna(age) else kind)
+        rows.append((label, txt, C_UP if kind == "골든크로스" else C_DOWN))
+    return rows
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_price_matrix(tickers: tuple, days: int, auth_key: str) -> dict:
@@ -1788,18 +1978,19 @@ def screen_with_tech(base: pd.DataFrame, tech: dict, mode: str) -> pd.DataFrame:
         # 바닥에서 올라오는 중인가: 과거 역배열 + 현재 단계적 회복
         score = flow
         score += d["역배열비율60"] * 100 * 0.15          # 최근까지 역배열이었을 것
-        score += (d["정배열단계"] / 3 * 100) * 0.20      # 지금 몇 단계 회복했나
-        score += pct(d["MA20기울기"]) * 0.15             # MA20 이 상승 전환했나
-        score += (d["종가"] > d["MA60"]).astype(int) * 100 * 0.15   # 60일선 회복
+        score += (d["정배열단계"] / d["배열단계최대"] * 100) * 0.20
+        score += pct(d["중기기울기"]) * 0.15
+        score += (d["종가"] > d["MA장기"]).astype(int) * 100 * 0.15
         d["기술판정"] = d.apply(
-            lambda x: f"{x['배열']} · {int(x['정배열단계'])}/3단계 회복 · MA20 {x['MA20기울기']:+.1f}%", axis=1)
+            lambda x: (f"{x['배열']} · {int(x['정배열단계'])}/{int(x['배열단계최대'])}단계 회복 "
+                       f"· MA{ma_mid()} {x['중기기울기']:+.1f}%"), axis=1)
     elif mode == "MACD 골든크로스":
         fresh = d["MACD전환일"].fillna(999)
         score = flow
         score += (fresh <= 5).astype(int) * 100 * 0.25   # 5일 이내 골든크로스
         score += (fresh <= 15).astype(int) * 100 * 0.10
         score += pct(d["MACD히스토"]) * 0.15
-        score += (d["종가"] > d["MA20"]).astype(int) * 100 * 0.15
+        score += (d["종가"] > d["MA중기"]).astype(int) * 100 * 0.15
         d["기술판정"] = d.apply(
             lambda x: (f"골든크로스 {int(x['MACD전환일'])}일 전"
                        if pd.notna(x["MACD전환일"]) else "히스토 음수") + f" · {x['배열']}", axis=1)
@@ -1823,8 +2014,8 @@ def tech_scenario(row: pd.Series, mode: str) -> dict:
         if v > 0:
             reasons.append(f"{inv} 순매수 {v:,.0f}억 (시총 대비 {row.get(f'강도_{inv}', 0):.2f}%)")
 
-    ma_txt = (f"MA5 {row['MA5']:,.0f} / MA20 {row['MA20']:,.0f} / "
-              f"MA60 {row['MA60']:,.0f} / MA120 {row['MA120']:,.0f}")
+    ma_txt = " / ".join(f"MA{n} {row[f'MA{n}']:,.0f}"
+                        for n in MA_SET if f"MA{n}" in row.index and pd.notna(row[f"MA{n}"]))
     reasons.append(f"배열 {row['배열']} · {ma_txt}")
     reasons.append(f"RSI {row['RSI']:.0f} · MACD 히스토 {row['MACD히스토']:+,.0f}")
     if pd.notna(row.get("거래량비")) and row["거래량비"] > 1.2:
@@ -1832,10 +2023,12 @@ def tech_scenario(row: pd.Series, mode: str) -> dict:
 
     if mode == "역배열→정배열 전환":
         reasons.append(f"최근 60일 중 {row['역배열비율60']*100:.0f}% 가 역배열 → 바닥권에서 회복 시도")
-        bull = (f"MA5 가 MA20 을 넘은 뒤 MA20 이 MA60 을 상향 돌파하면 정배열 완성. "
-                f"현재 {int(row['정배열단계'])}/3 단계. 남은 단계가 채워지는지가 관건.")
-        entry = f"MA20({row['MA20']:,.0f}) 눌림에서 분할 진입, 정배열 완성 시 추가."
-        invalid = f"MA5 가 MA20 아래로 재이탈하거나 MA60({row['MA60']:,.0f}) 하회 시 전환 실패로 간주."
+        bull = (f"MA{ma_fast()} 가 MA{ma_mid()} 을 넘은 뒤 MA{ma_mid()} 이 MA{ma_slow()} 을 "
+                f"상향 돌파하면 정배열 완성. 현재 {int(row['정배열단계'])}/"
+                f"{int(row['배열단계최대'])} 단계. 남은 단계가 채워지는지가 관건.")
+        entry = f"MA{ma_mid()}({row['MA중기']:,.0f}) 눌림에서 분할 진입, 정배열 완성 시 추가."
+        invalid = (f"MA{ma_fast()} 가 MA{ma_mid()} 아래로 재이탈하거나 "
+                   f"MA{ma_slow()}({row['MA장기']:,.0f}) 하회 시 전환 실패로 간주.")
     elif mode == "MACD 골든크로스":
         age = row["MACD전환일"]
         reasons.append(f"MACD 골든크로스 {int(age)}일 경과" if pd.notna(age) else "MACD 히스토 음수 구간")
@@ -1871,7 +2064,8 @@ def tech_figure(ticker: str, name: str, hist: dict, tech: dict):
         x=ohlc.index, open=ohlc[o], high=ohlc[h], low=ohlc[l], close=ohlc[c], name=name,
         increasing=dict(line=dict(color=C_UP, width=1), fillcolor=C_UP),
         decreasing=dict(line=dict(color=C_DOWN, width=1), fillcolor=C_DOWN)), row=1, col=1)
-    for n, col in zip(MA_SET, ["#E6EDF3", C_ACCENT, "#30A46C", "#8E4EC6"]):
+    for i_, n in enumerate(MA_SET):
+        col = MA_LINE_COLORS[i_ % len(MA_LINE_COLORS)]
         fig.add_trace(go.Scatter(x=ohlc.index, y=s["ma"][n].reindex(ohlc.index),
                                  name=f"MA{n}", mode="lines",
                                  line=dict(color=col, width=1.2)), row=1, col=1)
@@ -2085,8 +2279,8 @@ def load_watchlist(tickers: tuple, days: int, auth_key: str) -> pd.DataFrame:
                 "1일%": float(close.pct_change().iloc[-1] * 100),
                 f"{days}일%": float((close.iloc[-1] / close.iloc[-min(days, len(close))] - 1) * 100),
                 "배열": tech.get("배열", "—"), "RSI": tech.get("RSI", float("nan")),
-                "MA20이격%": ((float(close.iloc[-1]) / tech["MA20"] - 1) * 100
-                            if tech.get("MA20") else float("nan")),
+                "중기이격%": ((float(close.iloc[-1]) / tech["MA중기"] - 1) * 100
+                           if tech.get("MA중기") else float("nan")),
                 "외국인(억)": float(f["외국인"].sum()) if "외국인" in f else 0.0,
                 "기관(억)": float(f["기관"].sum()) if "기관" in f else 0.0,
                 "기타법인(억)": float(f["기타법인"].sum()) if "기타법인" in f else 0.0,
@@ -2320,6 +2514,225 @@ def load_stock_short(ticker: str, days: int, auth_key: str) -> pd.DataFrame:
     log("종목공매도", "수신", 티커=ticker, 행수=len(out))
     return out
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 개별 종목 수동 분석
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def load_ticker_directory(auth_key: str) -> pd.DataFrame:
+    """종목명 ↔ 코드 사전. 업종분류 API 가 이름과 업종을 함께 주므로 시장당 1회면 됩니다."""
+    stock = get_stock_api()
+    date = _latest_bday()
+    frames = []
+    for mkt in ("KOSPI", "KOSDAQ"):
+        try:
+            with capture_stdout("종목사전"):
+                df = _retry(lambda: stock.get_market_sector_classifications(date, mkt),
+                            "종목사전", tries=2)
+            if df is None or df.empty:
+                continue
+            nm = _pick(df.columns, "종목명")
+            sc = _pick(df.columns, "업종명")
+            d = pd.DataFrame(index=df.index)
+            d["종목명"] = df[nm] if nm is not None else d.index
+            d["업종"] = df[sc] if sc is not None else "미분류"
+            d["시장"] = mkt
+            frames.append(d)
+            log("종목사전", f"{mkt} 수신", 종목수=len(d))
+        except Exception as e:  # noqa: BLE001
+            log_exc("종목사전", e, f"{mkt} 조회 실패")
+    if not frames:
+        raise RuntimeError("종목 사전을 만들지 못했습니다")
+    out = pd.concat(frames)
+    out.index = out.index.astype(str).str.zfill(6)
+    return out
+
+
+def resolve_ticker(query: str, directory: pd.DataFrame) -> pd.DataFrame:
+    """6자리 숫자면 코드로, 아니면 종목명 부분일치로 찾습니다."""
+    q = (query or "").strip()
+    if not q:
+        return pd.DataFrame()
+    digits = q.replace(" ", "")
+    if digits.isdigit():
+        code = digits.zfill(6)
+        return directory[directory.index == code]
+    hit = directory[directory["종목명"].str.contains(q, case=False, na=False, regex=False)]
+    if hit.empty:
+        return hit
+    # 이름이 짧을수록(정확히 일치할수록) 위로
+    return hit.assign(_len=hit["종목명"].str.len()).sort_values("_len").drop(columns="_len")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def analyze_single(ticker: str, market: str, days: int, auth_key: str) -> dict:
+    """
+    한 종목에 대해 시세·수급·재무·공매도를 모두 모읍니다.
+    종목당 KRX 호출 5~6회로, 스크리너 2단계와 같은 깊이의 자료를 만듭니다.
+    """
+    stock = get_stock_api()
+    end = _latest_bday()
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(days * 1.55) + 30)).strftime("%Y%m%d")
+    log("종목분석", "시작", 티커=ticker, 시장=market, 기간=f"{start}~{end}")
+    out: dict = {"티커": ticker, "시장": market, "기준일": end, "경고": []}
+
+    def call(fn, *a, **k):
+        with capture_stdout("종목분석"):
+            return _retry(lambda: fn(*a, **k), "종목분석", tries=2)
+
+    # 시세
+    px = call(stock.get_market_ohlcv, start, end, ticker)
+    if px is None or px.empty:
+        raise RuntimeError("시세 데이터가 비어 있습니다. 종목코드를 확인하세요.")
+    px = px.copy()
+    px.index = pd.to_datetime(px.index)
+    close = pd.to_numeric(px[_pick(px.columns, "종가")], errors="coerce").dropna()
+    vol = pd.to_numeric(px[_pick(px.columns, "거래량")], errors="coerce")
+    out["ohlc"] = px
+    out["close"] = close
+    out["tech"] = compute_tech(close, vol)
+    if not out["tech"]:
+        out["경고"].append(f"시세가 {len(close)}일치뿐이라 이동평균·MACD 를 산출할 수 없습니다.")
+
+    hi = float(close.max())
+    lo = float(close.min())
+    cur = float(close.iloc[-1])
+    out["기간고가"] = hi
+    out["기간저가"] = lo
+    out["고가대비"] = (cur / hi - 1) * 100 if hi else float("nan")
+    out["저가대비"] = (cur / lo - 1) * 100 if lo else float("nan")
+
+    # 수급
+    try:
+        fl = call(stock.get_market_trading_value_by_date, start, end, ticker)
+        flow, detailed = _normalize_flow(fl)
+        out["flow"] = flow
+        out["detailed"] = detailed
+        out["momentum"] = flow_momentum(flow, 5)
+    except Exception as e:  # noqa: BLE001
+        log_exc("종목분석", e, "수급 조회 실패")
+        out["경고"].append("투자자별 수급을 가져오지 못했습니다.")
+        out["flow"] = pd.DataFrame()
+        out["momentum"] = {}
+
+    # 시가총액·거래대금
+    try:
+        cap = call(stock.get_market_cap, start, end, ticker)
+        out["시가총액"] = float(pd.to_numeric(cap[_pick(cap.columns, "시가총액")],
+                                          errors="coerce").iloc[-1]) / 1e8
+        tv = pd.to_numeric(cap[_pick(cap.columns, "거래대금")], errors="coerce")
+        out["거래대금"] = float(tv.tail(20).mean()) / 1e8
+    except Exception as e:  # noqa: BLE001
+        log_exc("종목분석", e, "시가총액 조회 실패")
+        out["시가총액"] = float("nan")
+        out["거래대금"] = float("nan")
+
+    # 재무
+    try:
+        fd = call(stock.get_market_fundamental, start, end, ticker)
+        for want in ("PER", "PBR", "DIV", "EPS", "BPS"):
+            c_ = _pick(fd.columns, want)
+            out[want] = (float(pd.to_numeric(fd[c_], errors="coerce").iloc[-1])
+                         if c_ is not None else float("nan"))
+        out["fund_series"] = fd
+    except Exception as e:  # noqa: BLE001
+        log_exc("종목분석", e, "재무 조회 실패")
+        for want in ("PER", "PBR", "DIV", "EPS", "BPS"):
+            out[want] = float("nan")
+
+    # 공매도
+    try:
+        sh = call(stock.get_shorting_balance_by_date, start, end, ticker)
+        sh = sh.copy()
+        sh.index = pd.to_datetime(sh.index)
+        c_ = _pick(sh.columns, "비중")
+        if c_ is not None:
+            s_ = pd.to_numeric(sh[c_], errors="coerce").dropna()
+            out["short"] = s_
+            out["공매도현재"] = float(s_.iloc[-1])
+            out["공매도이전"] = float(s_.iloc[0])
+    except Exception as e:  # noqa: BLE001
+        log_exc("종목분석", e, "공매도 조회 실패")
+        out["short"] = pd.Series(dtype=float)
+
+    log("종목분석", "완료", 티커=ticker, 시세일수=len(close))
+    return out
+
+
+def peer_rank(ticker: str, uni: pd.DataFrame, mode: str, min_cap: int,
+              min_value: int) -> dict:
+    """같은 기준으로 채점된 코스피 전체에서 이 종목이 몇 위인지."""
+    if uni is None or uni.empty:
+        return {}
+    ranked = screen_stocks(uni, mode, min_cap, min_value)
+    if ranked.empty or ticker not in ranked.index:
+        return {"제외": True, "전체": len(ranked)}
+    pos = int(ranked.index.get_loc(ticker)) + 1
+    row = ranked.loc[ticker]
+    parts = {c.replace("점수_", ""): float(row[c])
+             for c in ranked.columns if str(c).startswith("점수_")}
+    return {
+        "순위": pos, "전체": len(ranked),
+        "상위(%)": round(pos / len(ranked) * 100, 1),
+        "기회점수": float(row["기회점수"]),
+        "수급강도": float(row.get("수급강도", float("nan"))),
+        "매수주체수": int(row.get("매수주체수", 0)),
+        "구성": parts, "row": row,
+    }
+
+
+def single_verdict(a: dict, rank: dict) -> list:
+    """규칙에서 곧바로 유도되는 관찰 목록. 예측이 아니라 현재 상태의 요약입니다."""
+    t = a.get("tech", {}) or {}
+    lines = []
+
+    if t:
+        lines.append(("배열", f"{t['배열']} · 정배열 {int(t['정배열단계'])}/"
+                            f"{int(t.get('배열단계최대', 3))} 단계",
+                      C_UP if t["배열"] == "정배열" else
+                      C_DOWN if t["배열"] == "역배열" else C_ACCENT))
+        r_ = t.get("RSI", float("nan"))
+        if pd.notna(r_):
+            lines.append(("RSI", f"{r_:.0f} · 20일 저점 {t['RSI최저20']:.0f}",
+                          C_DOWN if r_ > 70 else C_UP if r_ < 30 else C_MUTED))
+        h_ = t.get("MACD히스토", float("nan"))
+        age = t.get("MACD전환일")
+        macd_txt = (f"골든크로스 {int(age)}일 경과" if pd.notna(age)
+                    else "히스토그램 음수 구간")
+        lines.append(("MACD", macd_txt, C_UP if pd.notna(age) else C_DOWN))
+
+    mom = a.get("momentum", {})
+    for who, m in mom.items():
+        tone = C_UP if "매수" in m["판정"] and "둔화" not in m["판정"] else \
+               C_DOWN if "매도가속" in m["판정"] else C_MUTED
+        lines.append((f"{who} 수급", f"{m['판정']} · 최근 {fmt_eok(m['최근'])}억 "
+                                   f"(직전 {fmt_eok(m['직전'])}억)", tone))
+
+    if pd.notna(a.get("공매도현재", float("nan"))):
+        cur, prv = a["공매도현재"], a["공매도이전"]
+        up = cur > prv
+        lines.append(("공매도 잔고", f"{cur:.2f}% · 이전 {prv:.2f}% ({'증가' if up else '감소'})",
+                      C_DOWN if up else C_UP))
+
+    if pd.notna(a.get("PBR", float("nan"))):
+        lines.append(("PBR", f"{a['PBR']:.2f}" +
+                      (" · 청산가치 이하" if a["PBR"] < 1 else ""),
+                      C_UP if a["PBR"] < 1 else C_MUTED))
+    if pd.isna(a.get("PER", float("nan"))) or a.get("PER", 0) <= 0:
+        lines.append(("PER", "산출 불가 — 적자 여부 확인 필요", C_DOWN))
+
+    lines.append(("기간 고점 대비", f"{a['고가대비']:+.1f}% · 저점 대비 {a['저가대비']:+.1f}%",
+                  C_DOWN if a["고가대비"] < -20 else C_MUTED))
+
+    if rank and not rank.get("제외"):
+        lines.append(("코스피 내 순위",
+                      f"{rank['순위']}위 / {rank['전체']}종목 (상위 {rank['상위(%)']:.0f}%)",
+                      C_UP if rank["상위(%)"] <= 20 else
+                      C_DOWN if rank["상위(%)"] >= 70 else C_ACCENT))
+    elif rank.get("제외"):
+        lines.append(("코스피 내 순위", f"필터 제외 (시총·거래대금·우선주 조건 미충족)", C_MUTED))
+    return lines
+
 # 판단 5인 + 실행 5인 + 차트 1인
 ALL_PERSONAS = PERSONAS + EXEC_PERSONAS + [CHART_PERSONA]
 
@@ -2335,6 +2748,23 @@ with st.sidebar:
         st.caption("KRX 는 로그인하지 않은 요청을 거부합니다.")
         krx_id = st.text_input("KRX 아이디", value=secret("KRX_ID"))
         krx_pw = st.text_input("KRX 비밀번호", value=secret("KRX_PW"), type="password")
+
+    preset = st.selectbox("이동평균 세트", list(MA_PRESETS.keys()) + ["직접 입력"],
+                          help="종목 차트·스크리너의 이동평균 기간입니다. "
+                               "가장 긴 기간만큼 과거 시세가 필요합니다.")
+    if preset == "직접 입력":
+        raw_ma = st.text_input("기간 (쉼표 구분)", value="5, 20, 60, 112, 224")
+        try:
+            picked = tuple(sorted({int(x) for x in raw_ma.replace(" ", "").split(",") if x}))
+            if 2 <= len(picked) <= 6 and all(2 <= p <= 480 for p in picked):
+                MA_SET = picked
+            else:
+                st.warning("2~6개, 각 2~480 사이로 입력하세요. 기본값을 유지합니다.")
+        except ValueError:
+            st.warning("숫자와 쉼표만 입력하세요. 기본값을 유지합니다.")
+    else:
+        MA_SET = MA_PRESETS[preset]
+    st.caption(f"적용: {' · '.join(map(str, MA_SET))}일 — 최소 {ma_min_len()}영업일 시세 필요")
 
     lookback = st.slider("조회 기간 (영업일)", 20, 250, 90, step=10)
     ma_window = st.select_slider("추세 필터 이동평균", options=[5, 10, 20, 60, 120], value=20)
@@ -2462,10 +2892,10 @@ st.write("")
 # 탭
 # ──────────────────────────────────────────────────────────────────────────────
 
-(tab_chart, tab_flow, tab_sector, tab_corp, tab_screen, tab_plan, tab_watch,
- tab_persona, tab_bt, tab_diag) = st.tabs(
+(tab_chart, tab_flow, tab_sector, tab_corp, tab_screen, tab_single, tab_plan,
+ tab_watch, tab_persona, tab_bt, tab_diag) = st.tabs(
     ["캔들 차트", "수급 상세", "섹터·밸류", "기타법인 추적", "종목 스크리너",
-     "매매 계획", "관심종목", "페르소나 회의", "검증", "진단"])
+     "종목 분석", "매매 계획", "관심종목", "페르소나 회의", "검증", "진단"])
 
 with tab_chart:
     opt = st.columns([2.2, 1, 1])
@@ -2806,10 +3236,14 @@ with tab_screen:
             if is_tech and not res.empty:
                 cands = tuple(res.sort_values("수급강도", ascending=False)
                               .head(int(cand_n)).index)
-                hist = load_price_matrix(cands, 224, krx_id)
+                hist = load_price_matrix(cands, max(MA_SET) + 40, krx_id)
                 for t_, h_ in hist.items():
                     m_ = compute_tech(h_["close"], h_.get("volume"))
                     if m_:
+                        cc_ = classify_chart(h_["close"])
+                        if cc_:
+                            m_["국면"] = cc_["상태"]
+                            m_["주가위치"] = cc_["주가위치"]
                         tech_map[t_] = m_
                 st.session_state["hist"] = hist
                 st.session_state["tech"] = tech_map
@@ -2842,10 +3276,15 @@ with tab_screen:
                "기타법인(억)": "{:+,.0f}", "외국인(억)": "{:+,.0f}", "연기금(억)": "{:+,.0f}",
                "매수주체": "{:.0f}", "거래대금(억)": "{:,.0f}"}
         if sc.get("tech"):
-            cols_base += ["배열", "정배열단계", "RSI", "MACD히스토", "MA20기울기", "이격도60"]
-            names_base += ["배열", "단계", "RSI", "MACD히스토", "MA20기울기%", "60일이격%"]
+            has_state = "국면" in picks.columns
+            cols_base += (["국면"] if has_state else []) + \
+                         ["배열", "정배열단계", "RSI", "MACD히스토", "중기기울기", "장기이격도"]
+            names_base += (["국면"] if has_state else []) + \
+                          ["배열", "단계", "RSI", "MACD히스토",
+                           f"MA{ma_mid()}기울기%", f"MA{ma_slow()}이격%"]
             fmt.update({"단계": "{:.0f}", "RSI": "{:.0f}", "MACD히스토": "{:+,.0f}",
-                        "MA20기울기%": "{:+.1f}", "60일이격%": "{:+.1f}"})
+                        f"MA{ma_mid()}기울기%": "{:+.1f}",
+                        f"MA{ma_slow()}이격%": "{:+.1f}"})
         else:
             cols_base += ["단기등락률", "장기등락률"]
             names_base += [f"{sc['days']}일%", "60일%"]
@@ -3299,7 +3738,7 @@ with tab_watch:
     if wl is not None and not wl.empty:
         dcol = f"{int(w_days)}일%" if f"{int(w_days)}일%" in wl.columns else None
         fmt_w = {"종가": "{:,.0f}", "1일%": "{:+.2f}", "RSI": "{:.0f}",
-                 "MA20이격%": "{:+.1f}", "외국인(억)": "{:+,.0f}",
+                 "중기이격%": "{:+.1f}", "외국인(억)": "{:+,.0f}",
                  "기관(억)": "{:+,.0f}", "기타법인(억)": "{:+,.0f}"}
         if dcol:
             fmt_w[dcol] = "{:+.1f}"
@@ -3419,6 +3858,247 @@ with tab_sector:
                          color=[C_ACCENT, C_MUTED], height=300)
             st.download_button("업종 집계 CSV", data=rot.to_csv().encode("utf-8-sig"),
                                file_name=f"sector_{now_kst():%Y%m%d}.csv", mime="text/csv")
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 종목 분석 탭 — 직접 지정한 종목을 스크리너와 같은 기준으로
+# ──────────────────────────────────────────────────────────────────────────────
+
+with tab_single:
+    st.markdown("### 종목 분석")
+    st.markdown(
+        "종목코드나 종목명을 넣으면 스크리너와 **같은 기준으로** 채점하고, "
+        "코스피 전체에서 몇 위인지까지 함께 보여줍니다. "
+        "스크리너에 안 잡힌 종목이 왜 안 잡혔는지 확인할 때도 씁니다."
+    )
+
+    q1 = st.columns([2.4, 1, 1])
+    query = q1[0].text_input("종목코드 또는 종목명",
+                             placeholder="005930 또는 삼성전자", key="single_q")
+    an_days = q1[1].number_input("조회 기간(영업일)", ma_min_len(), 600,
+                                 max(260, ma_min_len() + 60), step=20, key="single_days")
+    do_find = q1[2].button("분석", type="primary", use_container_width=True)
+
+    with st.expander("순위 산정 기준", expanded=False):
+        st.caption("아래 조건으로 코스피 전체를 채점한 뒤 이 종목의 위치를 찾습니다. "
+                   "조건이 바뀌면 순위도 바뀝니다.")
+        r1 = st.columns(4)
+        rk_mode = r1[0].selectbox("전략", ["낙폭과대 반등", "추세 지속"], key="rk_mode")
+        rk_days = r1[1].number_input("수급 집계일", 5, 60, 20, step=5, key="rk_days")
+        rk_cap = r1[2].number_input("최소 시총(억)", 500, 100000, 3000, step=500, key="rk_cap")
+        rk_val = r1[3].number_input("최소 거래대금(억)", 1, 5000, 20, step=5, key="rk_val")
+        st.markdown(
+            f"**{rk_mode}** 기준 배점 — " +
+            ("수급 35 · 매수주체수 15 · 저PBR 15 · 60일 낙폭 20 · 최근 회복 15"
+             if rk_mode == "낙폭과대 반등"
+             else "수급 35 · 매수주체수 15 · 저PBR 15 · 60일 추세 20 · 단기 추세 15"))
+        st.caption("모든 항목은 유니버스 안에서의 백분위입니다. 절대 기준이 아니라 "
+                   "'같은 조건의 다른 종목과 비교했을 때의 위치'입니다. "
+                   "우선주는 제외되고, 수급은 시가총액 대비 비율로 환산합니다.")
+
+    try:
+        directory = load_ticker_directory(krx_id)
+    except Exception as e:  # noqa: BLE001
+        log_exc("종목사전", e, "사전 로드 실패")
+        directory = pd.DataFrame()
+        st.error(f"종목 사전을 만들지 못했습니다 — {type(e).__name__}: {e}")
+
+    if do_find and query.strip() and not directory.empty:
+        hits = resolve_ticker(query, directory)
+        if hits.empty:
+            st.warning(f"'{query}' 에 해당하는 종목을 찾지 못했습니다. "
+                       "코드 6자리나 종목명 일부를 넣어 보세요.")
+            st.session_state.pop("single_hits", None)
+        else:
+            st.session_state["single_hits"] = hits.head(20)
+
+    hits = st.session_state.get("single_hits")
+    chosen = None
+    if hits is not None and not hits.empty:
+        if len(hits) == 1:
+            chosen = hits.index[0]
+        else:
+            label = st.selectbox(
+                f"{len(hits)}개 후보 — 종목 선택",
+                [f"{r['종목명']} ({t}) · {r['시장']} · {r['업종']}"
+                 for t, r in hits.iterrows()], key="single_pick")
+            chosen = label.split("(")[1].split(")")[0]
+
+    if chosen:
+        info = hits.loc[chosen]
+        try:
+            with st.spinner(f"{info['종목명']} 자료를 모으는 중… (호출 5~6회)"):
+                a = analyze_single(chosen, info["시장"], int(an_days), krx_id)
+            st.session_state["single_data"] = {"a": a, "info": info, "ticker": chosen}
+        except Exception as e:  # noqa: BLE001
+            log_exc("종목분석", e, "분석 실패")
+            st.error(f"분석 실패 — {type(e).__name__}: {e}")
+
+    sd = st.session_state.get("single_data")
+    if sd and sd["ticker"] == chosen:
+        a, info = sd["a"], sd["info"]
+        for w_ in a.get("경고", []):
+            st.warning(w_, icon="⚠️")
+
+        rank = {}
+        if info["시장"] == "KOSPI":
+            try:
+                uni_s = load_universe(int(rk_days), 60, krx_id)
+                rank = peer_rank(chosen, uni_s, rk_mode, int(rk_cap), int(rk_val))
+            except Exception as e:  # noqa: BLE001
+                log_exc("종목분석", e, "순위 산출 실패")
+
+        cur = float(a["close"].iloc[-1])
+        prv = float(a["close"].iloc[-2]) if len(a["close"]) > 1 else cur
+        k = st.columns(5)
+        k[0].markdown(kpi(f"{info['종목명']} ({chosen})", f"{cur:,.0f}원",
+                          f"{cur - prv:+,.0f} ({(cur/prv-1)*100:+.2f}%) · {info['업종']}",
+                          tone_for(cur - prv)), unsafe_allow_html=True)
+        k[1].markdown(kpi("시가총액", f"{a['시가총액']:,.0f}억",
+                          f"20일 평균 거래대금 {a['거래대금']:,.0f}억", C_MUTED),
+                      unsafe_allow_html=True)
+        k[2].markdown(kpi("PBR / PER",
+                          f"{a['PBR']:.2f} / " + ("—" if pd.isna(a['PER']) or a['PER'] <= 0
+                                                  else f"{a['PER']:.1f}"),
+                          "PER 없음 = 적자 가능" if pd.isna(a['PER']) or a['PER'] <= 0
+                          else f"배당수익률 {a['DIV']:.2f}%",
+                          C_UP if pd.notna(a['PBR']) and a['PBR'] < 1 else C_MUTED),
+                      unsafe_allow_html=True)
+        k[3].markdown(kpi("기간 고점 대비", f"{a['고가대비']:+.1f}%",
+                          f"저점 대비 {a['저가대비']:+.1f}%", tone_for(a['고가대비'])),
+                      unsafe_allow_html=True)
+        if rank and not rank.get("제외"):
+            k[4].markdown(kpi("코스피 내 순위", f"{rank['순위']}위",
+                              f"{rank['전체']}종목 중 상위 {rank['상위(%)']:.0f}% · "
+                              f"점수 {rank['기회점수']:.0f}",
+                              C_UP if rank["상위(%)"] <= 20 else C_ACCENT),
+                          unsafe_allow_html=True)
+        else:
+            k[4].markdown(kpi("코스피 내 순위", "제외",
+                              "시총·거래대금·우선주 필터 미충족" if rank else "KOSPI 종목만 채점",
+                              C_MUTED), unsafe_allow_html=True)
+
+        st.write("")
+        st.markdown("**관찰 요약**")
+        st.caption("규칙에서 곧바로 유도되는 현재 상태입니다. 예측이 아닙니다.")
+        rows_v = []
+        for label, text, tone in single_verdict(a, rank):
+            rows_v.append(
+                f'<div class="cm-trig"><div class="cm-mark">•</div>'
+                f'<div class="cm-text" style="color:{tone}">{label}'
+                f'<div class="cm-detail">{text}</div></div></div>')
+        st.markdown("".join(rows_v), unsafe_allow_html=True)
+
+        if rank and not rank.get("제외") and rank.get("구성"):
+            st.write("")
+            st.markdown("**점수 구성** — 어디서 점수를 얻었는가")
+            comp = pd.DataFrame({
+                "항목": list(rank["구성"].keys()),
+                "획득": [round(v, 1) for v in rank["구성"].values()],
+                "배점": [float(k.split("(")[1].rstrip(")")) for k in rank["구성"]],
+            })
+            comp["달성률(%)"] = (comp["획득"] / comp["배점"] * 100).round(0)
+            cc1, cc2 = st.columns([1, 1])
+            with cc1:
+                st.dataframe(comp.style.format({"획득": "{:.1f}", "배점": "{:.0f}",
+                                                "달성률(%)": "{:.0f}"}),
+                             use_container_width=True, hide_index=True)
+            with cc2:
+                st.bar_chart(comp.set_index("항목")[["획득"]], color=[C_ACCENT], height=200)
+            st.caption(f"합계 {rank['기회점수']:.0f}점. 달성률이 낮은 항목이 "
+                       "이 종목의 약점입니다.")
+
+        cc_state = classify_chart(a["close"]) if a.get("close") is not None else {}
+        if cc_state:
+            st.write("")
+            tone = (C_UP if cc_state["상태"] in ("완전정배열", "상승전환 진행", "바닥 다지기")
+                    else C_DOWN if cc_state["상태"] in ("완전역배열", "하락전환 진행")
+                    else C_ACCENT)
+            st.markdown(kpi(f"차트 국면 · {cc_state['상태']}", "",
+                            cc_state["설명"], tone), unsafe_allow_html=True)
+            st.write("")
+            st.markdown("**차트 구조 상세**")
+            rows_c = []
+            for label, text, t_ in chart_summary_rows(cc_state):
+                rows_c.append(
+                    f'<div class="cm-trig"><div class="cm-mark">•</div>'
+                    f'<div class="cm-text" style="color:{t_}">{label}'
+                    f'<div class="cm-detail">{text}</div></div></div>')
+            st.markdown("".join(rows_c), unsafe_allow_html=True)
+
+        st.divider()
+        if a.get("tech"):
+            st.markdown("**캔들 · 이동평균 · MACD · RSI**")
+            try:
+                st.plotly_chart(
+                    tech_figure(chosen, info["종목명"],
+                                {"ohlc": a["ohlc"]}, a["tech"]),
+                    use_container_width=True,
+                    config={"scrollZoom": True, "displaylogo": False},
+                    key=f"single_fig_{chosen}")
+            except Exception as e:  # noqa: BLE001
+                st.caption(f"차트 생성 실패: {e}")
+
+        fl = a.get("flow")
+        if fl is not None and not fl.empty:
+            st.markdown("**투자자별 일별 순매수 (억원)**")
+            mom = a.get("momentum", {})
+            mc = st.columns(max(1, len(mom)))
+            for i_, (who, m_) in enumerate(mom.items()):
+                tone = (C_UP if "매수" in m_["판정"] and "둔화" not in m_["판정"]
+                        else C_DOWN if "매도가속" in m_["판정"] else C_MUTED)
+                mc[i_].markdown(kpi(f"{who} · {m_['판정']}", f"{fmt_eok(m_['최근'])} 억",
+                                    f"직전 5일 {fmt_eok(m_['직전'])} 억", tone),
+                                unsafe_allow_html=True)
+            cols_f = [c for c in INVESTORS if c in fl.columns]
+            f1, f2 = st.columns([1.15, 1])
+            with f1:
+                st.bar_chart(fl[cols_f].tail(90), color=SERIES_COLORS[:len(cols_f)], height=270)
+            with f2:
+                st.markdown("기간 누적")
+                st.area_chart(fl[cols_f].cumsum(), color=SERIES_COLORS[:len(cols_f)], height=242)
+            if a.get("detailed") and "연기금" in fl.columns:
+                st.markdown("**기관 세부 주체별 순매수**")
+                st.bar_chart(fl[INSTITUTIONS].tail(90), color=INST_COLORS, height=240)
+
+        sh = a.get("short")
+        if sh is not None and len(sh):
+            up = a["공매도현재"] > a["공매도이전"]
+            st.markdown("**공매도 잔고 비중 추이 (%)**")
+            st.caption("수급이 들어오는데 공매도 잔고가 같이 늘고 있다면, "
+                       "매수 신호를 정면으로 반박하는 증거입니다.")
+            st.line_chart(sh.to_frame("잔고비중(%)"), color=[C_DOWN if up else C_UP],
+                          height=200)
+
+        st.divider()
+        c1, c2 = st.columns([1, 2])
+        if c1.button("이 종목을 매매 계획 후보로", use_container_width=True):
+            row = pd.DataFrame([{
+                "종목명": info["종목명"], "기회점수": rank.get("기회점수", 50.0),
+                "종가": cur, "시가총액": a["시가총액"], "거래대금": a["거래대금"],
+                "PBR": a["PBR"], "PER": a["PER"],
+                "단기등락률": float("nan"), "장기등락률": a["고가대비"],
+                "순매수_기타법인": 0.0, "순매수_외국인": 0.0, "순매수_연기금": 0.0,
+                "매수주체수": 0,
+            }], index=[chosen])
+            if rank and not rank.get("제외") and "row" in rank:
+                for c_ in row.columns:
+                    if c_ in rank["row"].index and pd.notna(rank["row"][c_]):
+                        row.loc[chosen, c_] = rank["row"][c_]
+            prev_picks = st.session_state.get("picks")
+            st.session_state["picks"] = (
+                pd.concat([prev_picks.drop(index=chosen, errors="ignore"), row])
+                if prev_picks is not None and not prev_picks.empty else row)
+            st.success(f"{info['종목명']} 을(를) 매매 계획 후보에 추가했습니다. "
+                       "매매 계획 탭에서 수량이 계산됩니다.")
+        c2.caption("추가하면 매매 계획 탭의 포지션 사이징과 페르소나 회의 자료에 함께 들어갑니다.")
+
+        st.warning(
+            "이 화면은 공개 시세·수급·재무 데이터를 정리한 것입니다. 실적 발표, 공시, "
+            "업황, 지배구조는 반영되어 있지 않습니다. 특히 순위가 높게 나와도 그것은 "
+            "'같은 규칙으로 줄 세웠을 때의 위치'일 뿐, 검증된 수익 예측이 아닙니다.",
+            icon="⚠️")
 
 
 st.divider()
