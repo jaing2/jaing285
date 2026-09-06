@@ -2733,6 +2733,249 @@ def single_verdict(a: dict, rank: dict) -> list:
         lines.append(("코스피 내 순위", f"필터 제외 (시총·거래대금·우선주 조건 미충족)", C_MUTED))
     return lines
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 매수 전 체크리스트 (20항목)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# 20개는 앱이 가진 데이터로 자동 판정하고, 10개는 사람만 알 수 있어 직접 확인합니다.
+# 자동 20 + 수동 10 = 30. 개수가 어긋나면 아래 add() 호출 수를 세어 보십시오.
+# 20개를 전부 빈 체크박스로 두면 아무도 읽지 않습니다.
+
+CHECK_MANUAL = [
+    ("공시", "DART 에서 최근 3개월 공시를 확인했다",
+     "유상증자·전환사채·자기주식취득·최대주주 변경. dart.fss.or.kr 에서 종목명 검색."),
+    ("재무", "직전 분기 실적과 부채비율을 확인했다",
+     "적자 전환, 매출 급감, 부채비율 급등은 이 앱이 전혀 모르는 정보입니다."),
+    ("뉴스", "최근 뉴스와 업황을 확인했다",
+     "소송, 리콜, 규제, 전방산업 둔화 등 가격에 이미 반영됐을 수 있는 사건."),
+    ("이유", "이 종목이 왜 지금 이 가격인지 설명할 수 있다",
+     "설명하지 못한다면 사는 것이 아니라 베팅하는 것입니다."),
+    ("손절", "손절가를 정했고 주문 시스템에 넣을 준비가 됐다",
+     "머릿속 손절은 지켜지지 않습니다. 스톱로스나 예약 주문으로 입력하십시오."),
+    ("분산", "보유 종목과 업종이 겹치지 않는다",
+     "같은 업종은 같은 악재에 함께 빠집니다. 종목 수가 많다고 분산이 아닙니다."),
+    ("종목상태", "관리종목·투자경고·거래정지·감사의견 비적정이 아니다",
+     "KRX 나 증권사 앱의 종목 상세에서 확인하십시오. 이 앱은 종목 상태를 알지 못합니다. "
+     "관리종목 지정은 수급·차트가 아무리 좋아도 무조건 회피 사유입니다."),
+    ("추격", "상한가나 급등 직후를 쫓아가는 것이 아니다",
+     "급등 다음 날 시가에 사는 것은 가장 비싼 값을 치르는 방법입니다. "
+     "눌림을 기다릴 수 있는지 스스로에게 물으십시오."),
+    ("분할", "한 번에 다 사지 않고 분할 진입 계획이 있다",
+     "1차 진입 비중과 2차 진입 조건을 미리 정해 두었는지 확인하십시오. "
+     "틀렸을 때 물타기가 아니라 계획된 추가 매수여야 합니다."),
+    ("심리", "'올라서' 사는 것이 아니고, 손실 복구 목적도 아니다",
+     "가격이 올랐다는 사실 자체는 매수 이유가 아닙니다. "
+     "최근 이 종목이나 비슷한 종목에서 잃은 돈을 되찾으려는 것이라면 멈추십시오."),
+]
+
+
+def _flag(ok, warn=False):
+    return "실패" if (not ok and not warn) else "주의" if warn else "통과"
+
+
+def buy_checklist(a: dict, rank: dict, cc: dict,
+                  min_cap: float = 3000, min_value: float = 20,
+                  market_score: Optional[int] = None) -> list:
+    """
+    자동 판정 20항목. 각 항목은 (분류, 문항, 판정, 근거) 를 돌려줍니다.
+    판정은 통과 / 주의 / 실패 / 확인불가 네 가지입니다.
+    """
+    t = a.get("tech", {}) or {}
+    mom = a.get("momentum", {}) or {}
+    fl = a.get("flow")
+    items = []
+
+    def add(cat, q, status, why, critical=False):
+        items.append({"분류": cat, "문항": q, "판정": status, "근거": why, "치명": critical})
+
+    # ── 시장 국면 1 ──────────────────────────────────────────────────────
+    # 개별 종목이 아무리 좋아도 시장 전체가 무너질 때는 같이 쓸려 내려갑니다.
+    if market_score is None:
+        add("시장", "시장 국면이 신규 진입을 허용하는가", "확인불가", "시장 스코어 없음")
+    else:
+        g_, g_label = market_gate(int(market_score))
+        add("시장", "시장 국면이 신규 진입을 허용하는가",
+            "통과" if g_ >= 0.75 else "주의" if g_ > 0 else "실패",
+            f"수급 스코어 {market_score}/100 → 진입 배율 ×{g_:.2f} ({g_label})",
+            critical=(g_ == 0))
+
+    # ── 수급 5 ───────────────────────────────────────────────────────────
+    f5 = float(fl["외국인"].tail(5).sum()) if fl is not None and "외국인" in fl else float("nan")
+    if pd.isna(f5):
+        add("수급", "외국인이 최근 5일 순매수인가", "확인불가", "수급 데이터 없음")
+    else:
+        add("수급", "외국인이 최근 5일 순매수인가",
+            _flag(f5 > 0), f"5일 누적 {fmt_eok(f5)}억")
+
+    if fl is not None and not fl.empty:
+        buyers = [w for w in ["외국인", "기관", "기타법인"]
+                  if w in fl.columns and fl[w].tail(5).sum() > 0]
+        add("수급", "매수 주체가 2곳 이상인가", _flag(len(buyers) >= 2, warn=len(buyers) == 1),
+            f"{len(buyers)}곳 순매수" + (f" ({', '.join(buyers)})" if buyers else ""))
+    else:
+        add("수급", "매수 주체가 2곳 이상인가", "확인불가", "수급 데이터 없음")
+
+    accel = [w for w, m in mom.items() if m["판정"] == "매수가속"]
+    hold = [w for w, m in mom.items() if m["판정"] == "매수유지"]
+    slow = [w for w, m in mom.items() if m["판정"] == "매수둔화"]
+    if not mom:
+        st_ = "확인불가"
+    elif accel or hold:
+        st_ = "통과"
+    elif slow:
+        st_ = "주의"
+    else:
+        st_ = "실패"          # 매수 주체가 하나도 없음
+    add("수급", "매수 흐름이 살아 있는가 (식는 중이 아닌가)", st_,
+        ", ".join(f"{w} {m['판정']}" for w, m in mom.items()) or "판정 불가")
+
+    if fl is not None and all(c in fl.columns for c in ["개인", "외국인", "기관"]):
+        solo = (fl["개인"].tail(5).sum() > 0 and fl["외국인"].tail(5).sum() < 0
+                and fl["기관"].tail(5).sum() < 0)
+        add("수급", "개인 홀로 사는 구조가 아닌가", _flag(not solo),
+            "개인만 매수, 외국인·기관 동반 매도" if solo else "개인 단독 매수 아님",
+            critical=True)
+    else:
+        add("수급", "개인 홀로 사는 구조가 아닌가", "확인불가", "수급 데이터 없음")
+
+    if fl is not None and "연기금" in fl.columns:
+        p5 = float(fl["연기금"].tail(5).sum())
+        add("수급", "연기금 등 장기 자금이 들어오는가",
+            _flag(p5 > 0, warn=p5 == 0), f"연기금 5일 누적 {fmt_eok(p5)}억")
+    else:
+        add("수급", "연기금 등 장기 자금이 들어오는가", "확인불가",
+            "상세 수급 응답 없음 (기관 세부 분해 불가)")
+
+    cur_s, prv_s = a.get("공매도현재"), a.get("공매도이전")
+    if pd.notna(cur_s) and pd.notna(prv_s):
+        rising = cur_s > prv_s
+        add("공매도", "공매도 잔고가 늘고 있지 않은가",
+            _flag(not rising, warn=rising and cur_s < 3.0),
+            f"현재 {cur_s:.2f}% · 이전 {prv_s:.2f}% ({'증가' if rising else '감소'})",
+            critical=rising and cur_s >= 5.0)
+    else:
+        add("공매도", "공매도 잔고가 늘고 있지 않은가", "확인불가", "공매도 데이터 없음")
+
+    # ── 차트 4 ───────────────────────────────────────────────────────────
+    if cc:
+        add("차트", "이동평균 배열이 악화 중이 아닌가",
+            _flag(cc["방향"] != "악화", warn=cc["방향"] == "유지" and cc["단계"] == 0),
+            f"{cc['상태']} · 단계 {cc['단계']}/{cc['단계최대']} · {cc['단계변화']}")
+        add("차트", f"주가가 중기선(MA{ma_mid()}) 위에 있는가",
+            _flag(cc["주가위치"] >= 2, warn=cc["주가위치"] == 1),
+            f"이동평균 {len(MA_SET)}개 중 {cc['주가위치']}개 위")
+        gap = cc["이격"].get(ma_mid(), float("nan"))
+        add("차트", "중기선 이격이 과도하지 않은가 (추격매수 아님)",
+            _flag(pd.isna(gap) or gap < 15, warn=pd.notna(gap) and 10 <= gap < 15),
+            f"MA{ma_mid()} 대비 {gap:+.1f}%" if pd.notna(gap) else "산출 불가")
+    else:
+        for q in ["이동평균 배열이 악화 중이 아닌가", "주가가 중기선 위에 있는가",
+                  "중기선 이격이 과도하지 않은가 (추격매수 아님)"]:
+            add("차트", q, "확인불가", f"시세가 {ma_min_len()}일 미만")
+
+    r_ = t.get("RSI", float("nan"))
+    add("차트", "RSI 가 과열 구간이 아닌가",
+        _flag(pd.isna(r_) or r_ < 70, warn=pd.notna(r_) and 65 <= r_ < 70),
+        f"RSI {r_:.0f}" if pd.notna(r_) else "산출 불가")
+
+    vr = t.get("거래량비", float("nan"))
+    if pd.isna(vr):
+        add("거래량", "거래량이 평소 수준을 유지하는가", "확인불가", "거래량 데이터 부족")
+    else:
+        add("거래량", "거래량이 평소 수준을 유지하는가",
+            _flag(0.5 <= vr <= 3.0, warn=(vr < 0.5 or vr > 3.0)),
+            f"최근 5일 평균이 60일 평균의 {vr:.2f}배"
+            + (" — 관심 이탈" if vr < 0.5 else " — 과열 가능" if vr > 3.0 else ""))
+
+    hist_s = (t.get("series", {}) or {}).get("macd", (None, None, None))[2]
+    if hist_s is None or len(hist_s.dropna()) < 8:
+        add("차트", "MACD 히스토그램이 확대 방향인가", "확인불가", "MACD 산출 불가")
+    else:
+        h = hist_s.dropna()
+        recent, prior = float(h.tail(3).mean()), float(h.iloc[-6:-3].mean())
+        widening = recent > prior
+        cur_h = float(h.iloc[-1])
+        if cur_h > 0 and widening:
+            st_h, why_h = "통과", "양수 구간에서 확대 중"
+        elif cur_h > 0:
+            st_h, why_h = "주의", "양수이나 축소 중 — 모멘텀 둔화"
+        elif widening:
+            st_h, why_h = "주의", "음수이나 개선 중"
+        else:
+            st_h, why_h = "실패", "음수이고 악화 중"
+        add("차트", "MACD 히스토그램이 확대 방향인가", st_h,
+            f"히스토 {cur_h:+,.1f} · {why_h}")
+
+    # ── 재무 2 ───────────────────────────────────────────────────────────
+    per = a.get("PER", float("nan"))
+    add("재무", "PER 이 산출되는가 (적자가 아닌가)",
+        _flag(pd.notna(per) and per > 0),
+        f"PER {per:.1f}" if pd.notna(per) and per > 0 else "산출 불가 — 적자 가능성",
+        critical=not (pd.notna(per) and per > 0))
+    pbr = a.get("PBR", float("nan"))
+    add("재무", "PBR 이 과도하지 않은가",
+        _flag(pd.isna(pbr) or pbr < 3, warn=pd.notna(pbr) and 2 <= pbr < 3),
+        f"PBR {pbr:.2f}" if pd.notna(pbr) else "산출 불가")
+
+    # ── 유동성·규모 2 ────────────────────────────────────────────────────
+    tv = a.get("거래대금", float("nan"))
+    cap = a.get("시가총액", float("nan"))
+    if pd.isna(tv) or pd.isna(cap):
+        add("유동성", "규모와 유동성이 기준을 넘는가", "확인불가", "시가총액·거래대금 산출 불가")
+    else:
+        ok_tv, ok_cap = tv >= min_value, cap >= min_cap
+        add("유동성", "규모와 유동성이 기준을 넘는가",
+            _flag(ok_tv and ok_cap, warn=ok_tv and ok_cap and tv < min_value * 2),
+            f"시총 {cap:,.0f}억 (기준 {min_cap:,.0f}) · "
+            f"20일 거래대금 {tv:,.0f}억 (기준 {min_value:,.0f})",
+            critical=not ok_tv)
+
+    # ── 상대 위치 2 ──────────────────────────────────────────────────────
+    if rank and not rank.get("제외"):
+        top = rank["상위(%)"]
+        add("순위", "같은 기준으로 채점했을 때 상위권인가",
+            _flag(top <= 30, warn=30 < top <= 50),
+            f"{rank['순위']}위 / {rank['전체']}종목 (상위 {top:.0f}%)")
+    else:
+        add("순위", "같은 기준으로 채점했을 때 상위권인가", "확인불가",
+            "필터 제외 또는 코스피 종목 아님")
+
+    dd = a.get("고가대비", float("nan"))
+    add("가격", "낙폭이 구조적 문제를 의심할 수준은 아닌가",
+        _flag(pd.isna(dd) or dd > -50, warn=pd.notna(dd) and -50 < dd <= -35),
+        f"기간 고점 대비 {dd:+.1f}%" if pd.notna(dd) else "산출 불가")
+
+    up = a.get("저가대비", float("nan"))
+    add("가격", "이미 과도하게 오른 뒤가 아닌가",
+        _flag(pd.isna(up) or up < 100, warn=pd.notna(up) and 50 <= up < 100),
+        f"기간 저점 대비 {up:+.1f}%" if pd.notna(up) else "산출 불가")
+
+    close_ = a.get("close")
+    if close_ is None or not len(close_):
+        add("데이터", "시세가 최신인가", "확인불가", "시세 없음")
+    else:
+        stale = (now_kst().date() - close_.index[-1].date()).days
+        add("데이터", "시세가 최신인가", _flag(stale <= 3, warn=3 < stale <= 7),
+            f"최근 영업일 {close_.index[-1]:%Y-%m-%d} · {stale}일 전")
+
+    return items
+
+
+def checklist_summary(auto_items: list, manual_done: int) -> dict:
+    passed = sum(1 for i in auto_items if i["판정"] == "통과")
+    warned = sum(1 for i in auto_items if i["판정"] == "주의")
+    failed = sum(1 for i in auto_items if i["판정"] == "실패")
+    unknown = sum(1 for i in auto_items if i["판정"] == "확인불가")
+    crit = [i for i in auto_items if i["치명"] and i["판정"] in ("실패", "주의")]
+    return {
+        "자동": len(auto_items), "통과": passed, "주의": warned,
+        "실패": failed, "확인불가": unknown,
+        "치명": crit,
+        "수동완료": manual_done, "수동전체": len(CHECK_MANUAL),
+        "총점": passed + manual_done,
+        "총항목": len(auto_items) + len(CHECK_MANUAL),
+    }
+
 # 판단 5인 + 실행 5인 + 차트 1인
 ALL_PERSONAS = PERSONAS + EXEC_PERSONAS + [CHART_PERSONA]
 
@@ -4072,8 +4315,93 @@ with tab_single:
                           height=200)
 
         st.divider()
+        st.markdown("### 매수 전 체크리스트")
+        st.markdown(
+            "30개 중 **20개는 앱이 가진 데이터로 자동 판정**하고, 나머지 10개는 "
+            "앱이 알 수 없어 직접 확인하셔야 합니다. 자동 판정 항목의 근거는 모두 "
+            "실제 수치입니다."
+        )
+
+        auto = buy_checklist(a, rank, cc_state,
+                             min_cap=float(rk_cap), min_value=float(rk_val),
+                             market_score=sig["score"])
+
+        ICON = {"통과": "✅", "주의": "⚠️", "실패": "❌", "확인불가": "❔"}
+        TONE = {"통과": C_UP, "주의": C_ACCENT, "실패": C_DOWN, "확인불가": C_MUTED}
+
+        st.markdown("**자동 판정 20항목**")
+        rows_a = []
+        for i_, it in enumerate(auto, 1):
+            mark = ICON[it["판정"]]
+            tone = TONE[it["판정"]]
+            crit = (' <span style="color:#E5484D;font-size:.72rem">치명</span>'
+                    if it["치명"] and it["판정"] in ("실패", "주의") else "")
+            rows_a.append(
+                f'<div class="cm-trig"><div class="cm-mark">{mark}</div>'
+                f'<div class="cm-text" style="color:{tone}">'
+                f'<span style="color:#6E7787">{i_:>2}. [{it["분류"]}]</span> {it["문항"]}{crit}'
+                f'<div class="cm-detail">{it["근거"]}</div></div>'
+                f'<div class="cm-w">{it["판정"]}</div></div>')
+        st.markdown("".join(rows_a), unsafe_allow_html=True)
+
+        st.write("")
+        st.markdown("**직접 확인 10항목** — 앱이 알 수 없는 정보입니다")
+        manual = []
+        for j_, (cat, q, hint) in enumerate(CHECK_MANUAL, 21):
+            manual.append(st.checkbox(f"{j_}. [{cat}] {q}", key=f"chk_single_{chosen}_{j_}",
+                                      help=hint))
+        st.caption("확인하지 않고 체크만 하는 것은 체크리스트가 아니라 형식입니다.")
+
+        summ = checklist_summary(auto, sum(manual))
+        st.write("")
+        sc_ = st.columns(4)
+        sc_[0].markdown(kpi("자동 판정", f"{summ['통과']}/{summ['자동']} 통과",
+                            f"주의 {summ['주의']} · 실패 {summ['실패']} · "
+                            f"확인불가 {summ['확인불가']}",
+                            C_UP if summ["실패"] == 0 else C_DOWN), unsafe_allow_html=True)
+        sc_[1].markdown(kpi("직접 확인", f"{summ['수동완료']}/{summ['수동전체']}",
+                            "전부 확인 전에는 주문 보류",
+                            C_UP if summ["수동완료"] == summ["수동전체"] else C_ACCENT),
+                        unsafe_allow_html=True)
+        sc_[2].markdown(kpi("종합", f"{summ['총점']}/{summ['총항목']}",
+                            "통과 + 확인 완료 합계",
+                            C_UP if summ["총점"] >= 25 else
+                            C_ACCENT if summ["총점"] >= 19 else C_DOWN),
+                        unsafe_allow_html=True)
+        sc_[3].markdown(kpi("치명 항목", f"{len(summ['치명'])}건",
+                            "하나라도 걸리면 재검토", 
+                            C_DOWN if summ["치명"] else C_UP), unsafe_allow_html=True)
+
+        if summ["치명"]:
+            st.error("**치명 항목이 걸렸습니다.** 다른 조건이 아무리 좋아도 "
+                     "아래는 먼저 해소되어야 합니다.\n\n"
+                     + "\n".join(f"- {c['문항']} → {c['근거']}" for c in summ["치명"]),
+                     icon="🛑")
+        elif summ["실패"] > 0:
+            st.warning(f"실패 {summ['실패']}건이 있습니다. 각 근거를 확인하고 "
+                       "감수할 만한 위험인지 판단하십시오.", icon="⚠️")
+        elif summ["수동완료"] < summ["수동전체"]:
+            st.info(f"자동 판정은 통과했습니다. 직접 확인 "
+                    f"{summ['수동전체'] - summ['수동완료']}건이 남았습니다.", icon="📋")
+        else:
+            st.success("30항목을 모두 통과·확인했습니다. 계획대로 진행하십시오.", icon="✅")
+
+        chk_df = pd.DataFrame(
+            [{"번호": i_, "구분": "자동", "분류": it["분류"], "문항": it["문항"],
+              "판정": it["판정"], "근거": it["근거"]}
+             for i_, it in enumerate(auto, 1)]
+            + [{"번호": j_, "구분": "수동", "분류": c_, "문항": q_,
+                "판정": "확인" if manual[j_ - 21] else "미확인", "근거": h_}
+               for j_, (c_, q_, h_) in enumerate(CHECK_MANUAL, 21)])
+        st.download_button(
+            "체크리스트 CSV", data=chk_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"check_{chosen}_{now_kst():%Y%m%d_%H%M}.csv", mime="text/csv",
+            key=f"chkdl_{chosen}")
+
+        st.divider()
         c1, c2 = st.columns([1, 2])
-        if c1.button("이 종목을 매매 계획 후보로", use_container_width=True):
+        if c1.button("이 종목을 매매 계획 후보로", use_container_width=True,
+                     disabled=bool(summ["치명"])):
             row = pd.DataFrame([{
                 "종목명": info["종목명"], "기회점수": rank.get("기회점수", 50.0),
                 "종가": cur, "시가총액": a["시가총액"], "거래대금": a["거래대금"],
@@ -4092,7 +4420,10 @@ with tab_single:
                 if prev_picks is not None and not prev_picks.empty else row)
             st.success(f"{info['종목명']} 을(를) 매매 계획 후보에 추가했습니다. "
                        "매매 계획 탭에서 수량이 계산됩니다.")
-        c2.caption("추가하면 매매 계획 탭의 포지션 사이징과 페르소나 회의 자료에 함께 들어갑니다.")
+        if summ["치명"]:
+            c2.caption("치명 항목이 해소되기 전에는 계획에 추가할 수 없습니다.")
+        else:
+            c2.caption("추가하면 매매 계획 탭의 포지션 사이징과 페르소나 회의 자료에 함께 들어갑니다.")
 
         st.warning(
             "이 화면은 공개 시세·수급·재무 데이터를 정리한 것입니다. 실적 발표, 공시, "
