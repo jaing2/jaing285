@@ -240,53 +240,120 @@ def secret(key: str, default: str = "") -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _STOCK = None
-AUTH_STATE: dict = {"시도": False, "성공": False, "계정": "", "메시지": "미시도"}
+
+# KRX 세션 재사용 정책
+LOGIN_TTL = 2700          # 45분. KRX 세션은 1시간이며 pykrx 가 55분에 만료 처리합니다.
+LOGIN_COOLDOWN = 600      # 로그인 실패 후 10분간 재시도 금지 (계정 차단 방지)
+
+
+@st.cache_resource(show_spinner=False)
+def krx_auth_store() -> dict:
+    """
+    로그인 상태 보관소.
+
+    Streamlit 은 위젯을 건드릴 때마다 스크립트를 처음부터 다시 실행합니다.
+    모듈 전역 변수는 그때마다 초기값으로 되돌아가므로, 여기에 상태를 두지 않으면
+    재실행마다 새 로그인이 발생해 KRX 가 계정을 차단합니다.
+    cache_resource 는 재실행과 세션을 넘어 같은 객체를 돌려줍니다.
+    """
+    return {"시도": False, "성공": False, "계정": "", "메시지": "미시도",
+            "로그인시각": 0.0, "실패시각": 0.0, "로그인횟수": 0, "재사용횟수": 0,
+            "만료시각": 0.0}
+
+
+AUTH_STATE = krx_auth_store()   # 재실행돼도 동일한 dict 를 가리킵니다
+
+
+def _live_krx_session():
+    """pykrx 가 이미 들고 있는 세션을 '로그인 없이' 들여다봅니다."""
+    try:
+        from pykrx.website.comm import auth as _a
+        cur = getattr(_a, "_auth_session", None)
+        if cur is not None and cur.is_valid():
+            return cur
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def ensure_krx_login(krx_id: str, krx_pw: str, force: bool = False) -> dict:
+    """
+    필요할 때만 로그인합니다. 순서는 다음과 같습니다.
+      ① pykrx 가 유효한 세션을 이미 갖고 있으면 그대로 재사용 (로그인 안 함)
+      ② 최근에 성공한 로그인이 아직 유효하면 재사용
+      ③ 직전 로그인이 실패했고 쿨다운 중이면 재시도하지 않음
+      ④ 위 어느 것도 아닐 때만 실제 로그인
+    """
+    store = krx_auth_store()
+    now = time.time()
+
+    if not (krx_id and krx_pw):
+        store.update(시도=False, 성공=False, 계정="",
+                     메시지="KRX_ID / KRX_PW 미설정 — 익명 요청은 KRX 가 거부합니다")
+        return store
+
+    if not force:
+        live = _live_krx_session()
+        if live is not None and store.get("계정") in ("", krx_id):
+            store["재사용횟수"] += 1
+            store.update(시도=True, 성공=True, 계정=krx_id,
+                         메시지="기존 세션 재사용", 만료시각=float(live.expiry_time))
+            return store
+
+        if (store.get("성공") and store.get("계정") == krx_id
+                and now - store.get("로그인시각", 0) < LOGIN_TTL):
+            store["재사용횟수"] += 1
+            store["메시지"] = "기존 세션 재사용"
+            return store
+
+        if (not store.get("성공") and store.get("계정") == krx_id
+                and now - store.get("실패시각", 0) < LOGIN_COOLDOWN):
+            left = int(LOGIN_COOLDOWN - (now - store["실패시각"]))
+            store["메시지"] = (f"로그인 실패 후 대기 중 — {left}초 뒤 재시도 가능 "
+                             "(반복 시도는 계정 차단을 부릅니다)")
+            log("인증", store["메시지"], level="WARN")
+            return store
+
+    store.update(시도=True, 계정=krx_id)
+    try:
+        from pykrx.website.comm.auth import build_krx_session, set_auth_session
+        with capture_stdout("인증"):
+            session = build_krx_session(krx_id, krx_pw)
+        store["로그인횟수"] += 1
+        if session is None:
+            store.update(성공=False, 실패시각=now,
+                         메시지="로그인 실패 — 아이디 또는 비밀번호를 확인하세요")
+            log("인증", store["메시지"], level="ERROR", 계정=krx_id,
+                누적로그인=store["로그인횟수"])
+        else:
+            set_auth_session(session)
+            store.update(성공=True, 로그인시각=now, 실패시각=0.0,
+                         메시지="신규 로그인 성공",
+                         만료시각=float(getattr(session, "expiry_time", now + 3600)))
+            log("인증", "KRX 신규 로그인", 계정=krx_id, 누적로그인=store["로그인횟수"])
+    except Exception as e:  # noqa: BLE001
+        store.update(성공=False, 실패시각=now,
+                     메시지=f"로그인 중 예외 — {type(e).__name__}: {e}")
+        log_exc("인증", e, "KRX 로그인 실패")
+    return store
 
 
 def get_stock_api(krx_id: str = "", krx_pw: str = ""):
     global _STOCK
     krx_id = krx_id or os.getenv("KRX_ID", "") or secret("KRX_ID")
     krx_pw = krx_pw or os.getenv("KRX_PW", "") or secret("KRX_PW")
+    # pykrx 가 스스로 세션을 갱신할 때 쓰므로 환경 변수는 항상 채워 둡니다.
     if krx_id:
         os.environ["KRX_ID"] = krx_id
     if krx_pw:
         os.environ["KRX_PW"] = krx_pw
 
     if _STOCK is None:
-        log("임포트", "pykrx 임포트", 자격증명="있음" if (krx_id and krx_pw) else "없음")
         with capture_stdout("임포트"):
             from pykrx import stock as _s
         _STOCK = _s
-        try:
-            import pykrx
-            log("임포트", "pykrx 준비 완료", 버전=getattr(pykrx, "__version__", "unknown"))
-        except Exception:  # noqa: BLE001
-            pass
 
-    if not (krx_id and krx_pw):
-        AUTH_STATE.update(시도=False, 성공=False, 계정="",
-                          메시지="KRX_ID / KRX_PW 미설정 — 익명 요청은 KRX 가 거부합니다")
-        log("인증", AUTH_STATE["메시지"], level="WARN")
-        return _STOCK
-
-    if AUTH_STATE.get("성공") and AUTH_STATE.get("계정") == krx_id:
-        return _STOCK
-
-    AUTH_STATE.update(시도=True, 계정=krx_id)
-    try:
-        from pykrx.website.comm.auth import build_krx_session, set_auth_session
-        with capture_stdout("인증"):
-            session = build_krx_session(krx_id, krx_pw)
-        if session is None:
-            AUTH_STATE.update(성공=False, 메시지="로그인 실패 — 아이디 또는 비밀번호를 확인하세요")
-            log("인증", AUTH_STATE["메시지"], level="ERROR", 계정=krx_id)
-        else:
-            set_auth_session(session)
-            AUTH_STATE.update(성공=True, 메시지="로그인 성공")
-            log("인증", "KRX 로그인 성공", 계정=krx_id)
-    except Exception as e:  # noqa: BLE001
-        AUTH_STATE.update(성공=False, 메시지=f"로그인 중 예외 — {type(e).__name__}: {e}")
-        log_exc("인증", e, "KRX 로그인 실패")
+    ensure_krx_login(krx_id, krx_pw)
     return _STOCK
 
 
@@ -301,15 +368,14 @@ def probe_krx(krx_id: str = "", krx_pw: str = "") -> dict:
     start = (now_kst() - timedelta(days=14)).strftime("%Y%m%d")
     payload = {"bld": "dbms/MDC/STAT/standard/MDCSTAT00301", "indIdx": "1", "indIdx2": "001",
                "strtDd": start, "endDd": end, "share": "2", "money": "3", "csvxls_isNo": "false"}
+    # 진단 때문에 새로 로그인하지 않습니다. 이미 열려 있는 세션만 빌려 씁니다.
     session = None
     if krx_id and krx_pw:
-        try:
-            from pykrx.website.comm.auth import build_krx_session
-            with capture_stdout("프로브"):
-                krxs = build_krx_session(krx_id, krx_pw)
-            session = getattr(krxs, "session", None)
-        except Exception as e:  # noqa: BLE001
-            log_exc("프로브", e, "프로브용 로그인 실패")
+        get_stock_api(krx_id, krx_pw)
+        live = _live_krx_session()
+        session = getattr(live, "session", None) if live else None
+        if session is None:
+            log("프로브", "유효한 세션이 없어 익명으로 요청합니다", level="WARN")
 
     out: dict = {"조회기간": f"{start}~{end}", "인증세션": "사용" if session else "미사용"}
     try:
@@ -1468,21 +1534,26 @@ def build_trade_plan(picks: pd.DataFrame, capital: float, risk_pct: float, stop_
 @st.cache_data(ttl=7200, show_spinner=False)
 def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
                       min_cap: int, min_val: int, sc_days: int,
-                      fee_pct: float, tax_pct: float, auth_key: str) -> dict:
+                      fee_pct: float, tax_pct: float, auth_key: str,
+                      cand_n: int = 40) -> dict:
     """
-    과거 리밸런스 시점마다 유니버스를 재구성해 상위 N 종목을 뽑고,
+    과거 리밸런스 시점마다 유니버스를 그 시점 기준으로 재구성해 상위 N 종목을 뽑고,
     보유 기간 후 수익률을 코스피 대비로 측정합니다. 왕복 비용을 차감합니다.
 
-    리밸런스 1회당 KRX 호출 약 8회. 시간이 걸리므로 2시간 캐시합니다.
+    3단계로 나눠 미래 정보 유입을 막습니다.
+      1단계 — 각 시점의 시세·재무·수급으로 유니버스 구성 (시점당 8회 호출)
+      2단계 — 기술적 전략일 때만, 1단계 후보의 전체 시세를 한 번씩 조회
+      3단계 — 각 시점에서 그 날짜까지만 잘라 지표를 계산하고 채점
+
+    2단계에서 받은 시세는 항상 해당 시점 이전 구간만 잘라 쓰므로,
+    나중 정보가 과거 판단에 섞이지 않습니다.
     """
-    if mode in TECH_MODES:
-        raise RuntimeError(
-            "기술적 전략은 백테스트를 지원하지 않습니다. 과거 시점의 후보를 오늘의 수급으로 "
-            "고르면 미래 정보가 새어 들어가고(lookahead bias), 시점마다 전종목 224일 시세를 "
-            "다시 받으면 호출량이 수천 회가 됩니다. 수급 전략으로 먼저 검증하세요.")
     stock = get_stock_api()
+    is_tech = mode in TECH_MODES
     end = _latest_bday()
     span = (rebalances + 2) * hold_days + sc_days + 80
+    if is_tech:
+        span += max(MA_SET) + 40
     idx_start = (pd.Timestamp(end) - pd.Timedelta(days=int(span * 1.6))).strftime("%Y%m%d")
 
     with capture_stdout("스크리너BT"):
@@ -1495,19 +1566,24 @@ def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
     close = pd.to_numeric(kospi[_pick(kospi.columns, "종가")], errors="coerce")
     close.index = cal
 
-    # 마지막 관측이 hold_days 뒤에 존재해야 하므로 뒤에서부터 배치
+    need_back = sc_days + 60 + (ma_min_len() if is_tech else 0)
     idxs = [len(cal) - 1 - hold_days - i * hold_days for i in range(rebalances)]
-    idxs = [i for i in idxs if i - sc_days - 60 > 0][::-1]
+    idxs = [i for i in idxs if i - need_back > 0][::-1]
     if not idxs:
-        raise RuntimeError("표본을 만들 만큼 과거 데이터가 없습니다. 리밸런스 수나 보유일을 줄이세요")
+        raise RuntimeError(
+            "표본을 만들 만큼 과거 데이터가 없습니다. 리밸런스 수나 보유일을 줄이거나, "
+            "기술적 전략이라면 더 짧은 이동평균 세트를 쓰세요.")
 
     def call(fn, *a, **k):
         with capture_stdout("스크리너BT"):
             return _retry(lambda: fn(*a, **k), "스크리너BT", tries=2)
 
-    recs, per_period = [], []
-    log("스크리너BT", "백테스트 시작", 리밸런스=len(idxs), 보유일=hold_days, 전략=mode)
+    log("스크리너BT", "1단계 시작", 리밸런스=len(idxs), 보유일=hold_days,
+        전략=mode, 기술=is_tech)
 
+    # ── 1단계: 시점별 유니버스 ────────────────────────────────────────────
+    snaps = []
+    p1 = st.progress(0.0, text="1단계 — 시점별 유니버스 재구성 중…")
     for n, i in enumerate(idxs):
         d0 = cal[i]
         d1 = cal[min(i + hold_days, len(cal) - 1)]
@@ -1542,33 +1618,100 @@ def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
                 except Exception:  # noqa: BLE001
                     u[f"순매수_{inv}"] = 0.0
 
-            ranked = screen_stocks(u, mode, min_cap, min_val)
-            if ranked.empty:
+            base = screen_stocks(u, "낙폭과대 반등" if is_tech else mode, min_cap, min_val)
+            if base.empty:
                 continue
-            picks = ranked.head(top_n)
+            if is_tech:
+                base = base.sort_values("수급강도", ascending=False).head(int(cand_n))
             fret = pd.to_numeric(fwd[_pick(fwd.columns, "등락률")], errors="coerce")
-            r = fret.reindex(picks.index).dropna()
-            if r.empty:
-                continue
-
-            cost = fee_pct * 2 + tax_pct
-            net = r.mean() - cost
             bench = (close.iloc[min(i + hold_days, len(close) - 1)] / close.iloc[i] - 1) * 100
-            per_period.append({
-                "진입일": f"{d0:%Y-%m-%d}", "청산일": f"{d1:%Y-%m-%d}", "종목수": len(r),
-                "평균(%)": round(r.mean(), 2), "비용차감(%)": round(net, 2),
-                "코스피(%)": round(bench, 2), "초과(%)": round(net - bench, 2),
-                "승률(%)": round((r > cost).mean() * 100, 1),
-            })
-            all_r = fret.reindex(ranked.index).dropna()
-            for t_, v_ in all_r.items():
-                recs.append({"기간": f"{d0:%Y-%m-%d}", "티커": t_, "수익률": float(v_),
-                             "점수": float(ranked.loc[t_, "기회점수"]), "코스피": bench})
-            log("스크리너BT", f"{n+1}/{len(idxs)} 완료", 진입일=f"{d0:%Y-%m-%d}",
-                평균=f"{r.mean():.2f}%", 코스피=f"{bench:.2f}%")
+            snaps.append({"i": i, "d0": d0, "d1": d1, "base": base,
+                          "fret": fret, "bench": float(bench)})
+            log("스크리너BT", f"1단계 {n+1}/{len(idxs)}", 진입일=f"{d0:%Y-%m-%d}",
+                후보=len(base))
         except Exception as e:  # noqa: BLE001
-            log_exc("스크리너BT", e, f"{ds} 구간 실패")
+            log_exc("스크리너BT", e, f"{ds} 유니버스 실패")
+        p1.progress((n + 1) / len(idxs), text=f"1단계 {n+1}/{len(idxs)} 시점")
+    p1.empty()
+
+    if not snaps:
+        raise RuntimeError("유효한 시점이 없습니다")
+
+    # ── 2단계: 기술적 전략일 때만 후보 시세 일괄 조회 ─────────────────────
+    hist = {}
+    if is_tech:
+        union = sorted({t for sn in snaps for t in sn["base"].index})
+        h_start = (snaps[0]["d0"] - pd.Timedelta(days=int(ma_min_len() * 1.7))).strftime("%Y%m%d")
+        log("스크리너BT", "2단계 시작", 고유종목=len(union), 시세시작=h_start)
+        p2 = st.progress(0.0, text=f"2단계 — 후보 {len(union)}종목 시세 조회 중…")
+        for n, t in enumerate(union):
+            try:
+                with capture_stdout("스크리너BT"):
+                    d_ = _retry(lambda: stock.get_market_ohlcv(h_start, end, t),
+                                "스크리너BT", tries=2)
+                if d_ is not None and not d_.empty:
+                    d_ = d_.copy()
+                    d_.index = pd.to_datetime(d_.index)
+                    cc_ = _pick(d_.columns, "종가")
+                    vc_ = _pick(d_.columns, "거래량")
+                    if cc_ is not None:
+                        hist[t] = {
+                            "close": pd.to_numeric(d_[cc_], errors="coerce").dropna(),
+                            "volume": pd.to_numeric(d_[vc_], errors="coerce") if vc_ else None,
+                        }
+            except Exception:  # noqa: BLE001
+                pass
+            p2.progress((n + 1) / len(union), text=f"2단계 {n+1}/{len(union)} 종목")
+            time.sleep(0.1)
+        p2.empty()
+        log("스크리너BT", "2단계 완료", 성공=len(hist), 실패=len(union) - len(hist))
+
+    # ── 3단계: 시점별 채점과 성과 집계 ────────────────────────────────────
+    recs, per_period = [], []
+    for sn in snaps:
+        d0, base, fret, bench = sn["d0"], sn["base"], sn["fret"], sn["bench"]
+        if is_tech:
+            tmap = {}
+            for t in base.index:
+                h_ = hist.get(t)
+                if not h_:
+                    continue
+                # 이 시점까지만 잘라 씁니다. 이후 데이터는 보지 않습니다.
+                cl = h_["close"].loc[:d0]
+                vl = h_["volume"].loc[:d0] if h_["volume"] is not None else None
+                if len(cl) < ma_min_len():
+                    continue
+                m_ = compute_tech(cl, vl)
+                if m_:
+                    cc_ = classify_chart(cl)
+                    if cc_:
+                        m_["국면"] = cc_["상태"]
+                        m_["주가위치"] = cc_["주가위치"]
+                    tmap[t] = m_
+            if not tmap:
+                continue
+            ranked = screen_with_tech(base.loc[list(tmap.keys())], tmap, mode)
+        else:
+            ranked = base
+        if ranked.empty:
             continue
+
+        picks = ranked.head(top_n)
+        r = fret.reindex(picks.index).dropna()
+        if r.empty:
+            continue
+        cost = fee_pct * 2 + tax_pct
+        net = r.mean() - cost
+        per_period.append({
+            "진입일": f"{d0:%Y-%m-%d}", "청산일": f"{sn['d1']:%Y-%m-%d}", "종목수": len(r),
+            "평균(%)": round(r.mean(), 2), "비용차감(%)": round(net, 2),
+            "코스피(%)": round(bench, 2), "초과(%)": round(net - bench, 2),
+            "승률(%)": round((r > cost).mean() * 100, 1),
+        })
+        all_r = fret.reindex(ranked.index).dropna()
+        for t_, v_ in all_r.items():
+            recs.append({"기간": f"{d0:%Y-%m-%d}", "티커": t_, "수익률": float(v_),
+                         "점수": float(ranked.loc[t_, "기회점수"]), "코스피": bench})
 
     if not per_period:
         raise RuntimeError("유효한 구간이 없습니다")
@@ -1587,7 +1730,7 @@ def screener_backtest(rebalances: int, hold_days: int, mode: str, top_n: int,
     }
     log("스크리너BT", "백테스트 완료", **{k: v for k, v in list(summary.items())[:4]})
     return {"per_period": pp, "summary": summary, "records": pd.DataFrame(recs),
-            "mode": mode, "hold": hold_days, "top_n": top_n}
+            "mode": mode, "hold": hold_days, "top_n": top_n, "tech": is_tech}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3346,14 +3489,30 @@ with tab_bt:
     bt_reb = b[0].number_input("리밸런스 횟수", 4, 24, 10, step=1)
     bt_hold = b[1].number_input("보유 기간(영업일)", 5, 60, 20, step=5)
     bt_top = b[2].number_input("편입 종목 수", 3, 30, 10, step=1)
-    bt_mode = b[3].selectbox("전략", ["낙폭과대 반등", "추세 지속"], key="btmode")
-    st.caption(f"예상 KRX 호출 약 {int(bt_reb) * 8}회 · 1~3분 소요 · 결과는 2시간 캐시")
+    bt_mode = b[3].selectbox("전략", ALL_MODES, key="btmode")
+
+    bt_tech = bt_mode in TECH_MODES
+    if bt_tech:
+        bt_cand = st.number_input("시점별 후보 수 (2단계 조회 대상)", 20, 80, 40, step=10,
+                                  help="각 시점에서 수급 상위 N종목만 시세를 조회해 "
+                                       "지표를 계산합니다. 클수록 정확하지만 느립니다.")
+        est = int(bt_reb) * 8 + int(bt_cand) * 2
+        st.caption(f"예상 KRX 호출 약 {est}회 (1단계 {int(bt_reb)*8} + 2단계 약 "
+                   f"{int(bt_cand)*2}) · {est*0.4/60:.0f}~{est*0.9/60:.0f}분 소요 · 2시간 캐시")
+        st.info(
+            "기술적 전략은 시점마다 그 날짜까지만 잘라서 지표를 계산합니다. "
+            f"이동평균 세트가 {' · '.join(map(str, MA_SET))}일이라 시점당 최소 "
+            f"{ma_min_len()}영업일의 과거 시세가 필요하고, 그만큼 표본 구간이 짧아집니다.",
+            icon="🔬")
+    else:
+        bt_cand = 40
+        st.caption(f"예상 KRX 호출 약 {int(bt_reb) * 8}회 · 1~3분 소요 · 결과는 2시간 캐시")
 
     if st.button("스크리너 백테스트 실행"):
         try:
             with st.spinner("과거 시점 유니버스를 재구성하는 중… 시간이 걸립니다"):
                 sbt = screener_backtest(int(bt_reb), int(bt_hold), bt_mode, int(bt_top),
-                                        3000, 20, 20, 0.015, 0.15, krx_id)
+                                        3000, 20, 20, 0.015, 0.15, krx_id, int(bt_cand))
             st.session_state["sbt"] = sbt
             hr = hit_rate_table(sbt["records"], 0.015 * 2 + 0.15)
             st.session_state["hitrate"] = {"table": hr, "mode": bt_mode,
@@ -3399,7 +3558,23 @@ with tab_bt:
 with tab_diag:
     s1, s2 = st.columns(2)
     s1.markdown("**KRX 인증**")
-    s1.json(meta.get("인증", AUTH_STATE))
+    _st = krx_auth_store()
+    _now = time.time()
+    _exp = _st.get("만료시각", 0)
+    s1.json({
+        "성공": _st.get("성공"), "계정": _st.get("계정"), "메시지": _st.get("메시지"),
+        "신규 로그인 횟수": _st.get("로그인횟수"),
+        "세션 재사용 횟수": _st.get("재사용횟수"),
+        "마지막 로그인": (datetime.fromtimestamp(_st["로그인시각"], KST)
+                     .strftime("%Y-%m-%d %H:%M:%S") if _st.get("로그인시각") else "없음"),
+        "세션 만료까지": (f"{int((_exp - _now) / 60)}분" if _exp > _now else "만료 또는 없음"),
+    })
+    if s1.button("강제 재로그인", help="세션이 꼬였을 때만 사용하세요. "
+                                  "반복 클릭은 계정 차단을 부릅니다."):
+        ensure_krx_login(krx_id, krx_pw, force=True)
+        st.rerun()
+    s1.caption("정상이라면 '신규 로그인 횟수'는 몇 시간에 한 번만 늘어납니다. "
+               "화면을 조작할 때마다 늘어난다면 세션 재사용이 깨진 것입니다.")
     s2.markdown("**데이터 파이프라인**")
     s2.json({"상세분해": meta.get("상세분해"), "수집시각": meta.get("수집시각"),
              "행수": meta.get("행수"), "최근영업일": meta.get("최근영업일"),
